@@ -1,0 +1,32 @@
+{
+  "name": "brain",
+  "private": true,
+  "type": "module",
+  "description": "Local second brain for software project notes, semantic recall, and Obsidian write-back.",
+  "scripts": {
+    "brain:init": "node apps/cli/index.mjs init",
+    "brain:scan": "node apps/cli/index.mjs scan",
+    "brain:sync": "node apps/cli/index.mjs sync",
+    "brain:embed": "node apps/cli/index.mjs embed",
+    "brain:query": "node apps/cli/index.mjs query",
+    "brain:consult": "node apps/cli/index.mjs consult",
+    "brain:validate:vault": "node apps/cli/index.mjs validate-vault",
+    "brain:doctor": "node apps/cli/index.mjs doctor",
+    "brain:mcp": "node apps/mcp-server/index.mjs",
+    "brain:mcp:healthcheck": "node apps/mcp-server/index.mjs --healthcheck",
+    "brain:learn": "node apps/cli/index.mjs learn",
+    "brain:watch": "node apps/cli/index.mjs watch",
+    "brain:status": "node apps/cli/index.mjs status",
+    "brain:api": "node apps/api/index.mjs",
+    "brain:test": "node --test tests/brain.test.mjs",
+    "brain:sync:self-test": "node apps/cli/index.mjs sync --project brain --include-brain --vault-root ./obsidian-sync --state-path ./data/state/self-test-state.json",
+    "brain:bootstrap:python": "python3 -m venv .venv && ./.venv/bin/python -m pip install --upgrade pip && ./.venv/bin/python -m pip install chromadb sentence-transformers"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
+  }
+}

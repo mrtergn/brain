@@ -1,0 +1,6 @@
+{
+  "projectsRoot": "..",
+  "vaultRoot": "/absolute/path/to/Obsidian/Brain",
+  "dataRoot": "./data",
+  "pythonExecutable": "./.venv/bin/python"
+}
