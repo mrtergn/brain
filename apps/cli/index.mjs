@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { parseArgs, extractProjectNames } from '../../packages/shared/index.mjs';
+import { shutdownEmbeddingService } from '../../packages/embeddings/index.mjs';
 import {
   runConsult,
   runDoctor,
@@ -36,148 +37,162 @@ export async function main(argv = process.argv.slice(2)) {
     pythonExecutable: args.python,
   };
 
-  switch (command) {
-    case 'init': {
-      const payload = await runInit(baseOptions);
-      console.log(`Brain initialized.`);
-      console.log(`Config file: ${payload.config.configFilePath ?? 'none'}`);
-      console.log(`Projects root: ${payload.config.projectsRoot}`);
-      console.log(`Vault root: ${payload.config.vaultRoot}`);
-      console.log(`Data root: ${payload.config.dataRoot}`);
-      console.log(`Chroma root: ${payload.config.chromaRoot}`);
-      console.log(`Log root: ${payload.config.logRoot}`);
-      console.log(`Runtime state: ${payload.config.statePath}`);
-      console.log(`Generated runners: ${payload.config.runtimeRoot}`);
-      return;
-    }
-    case 'scan': {
-      const payload = await runScan(baseOptions);
-      console.log(`Scan completed at ${payload.scanResult.completedAt}`);
-      console.log(`Projects scanned: ${payload.scanResult.projects.length}`);
-      console.log(`Changed projects: ${payload.changedProjects.join(', ') || 'none'}`);
-      if (payload.scanResult.failures.length > 0) {
-        console.log(`Failures: ${payload.scanResult.failures.length}`);
+  try {
+    switch (command) {
+      case 'init': {
+        const payload = await runInit(baseOptions);
+        console.log(`Brain initialized.`);
+        console.log(`Config file: ${payload.config.configFilePath ?? 'none'}`);
+        console.log(`Projects root: ${payload.config.projectsRoot}`);
+        console.log(`Vault root: ${payload.config.vaultRoot}`);
+        console.log(`Data root: ${payload.config.dataRoot}`);
+        console.log(`Chroma root: ${payload.config.chromaRoot}`);
+        console.log(`Log root: ${payload.config.logRoot}`);
+        console.log(`Runtime state: ${payload.config.statePath}`);
+        console.log(`Generated runners: ${payload.config.runtimeRoot}`);
+        return;
       }
-      return;
-    }
-    case 'sync': {
-      const payload = await runSync(baseOptions);
-      console.log(`Sync completed at ${payload.syncSummary.completedAt}`);
-      console.log(`Updated projects: ${payload.syncSummary.updatedProjects.join(', ') || 'none'}`);
-      console.log(`Unchanged projects: ${payload.syncSummary.unchangedProjects.length}`);
-      return;
-    }
-    case 'embed': {
-      const payload = await runEmbed(baseOptions);
-      console.log(`Embed completed at ${payload.state.lastEmbedAt}`);
-      console.log(`Embedded projects: ${payload.embeddedProjects.map((project) => project.name).join(', ') || 'none'}`);
-      return;
-    }
-    case 'query': {
-      const queryText = String(args.query ?? args._.slice(1).join(' ')).trim();
-      const payload = await runQuery({ ...baseOptions, queryText });
-      console.log(`Mode: ${payload.reasoning.mode}`);
-      console.log(`Related projects: ${payload.reasoning.relatedProjects.join(', ') || 'none'}`);
-      console.log('Top results:');
-      for (const result of payload.retrievalResponse.results.slice(0, 5)) {
-        console.log(`- ${result.project}/${result.noteType} | score=${result.relevanceScore} | ${result.snippet}`);
-      }
-      console.log('Suggestions:');
-      for (const suggestion of payload.reasoning.solutionSuggestions) {
-        console.log(`- ${suggestion}`);
-      }
-      return;
-    }
-    case 'consult': {
-      const queryText = String(args.query ?? args._.slice(1).join(' ')).trim();
-      const payload = await runConsult({ ...baseOptions, queryText, currentProjectName: baseOptions.projectNames?.[0] ?? null });
-      console.log(`Mode: ${payload.consultation.mode}`);
-      console.log(`Local confidence: ${payload.consultation.localConfidence.score} (${payload.consultation.localConfidence.level})`);
-      console.log(`Web research required: ${payload.consultation.researchDecision.needsWebResearch ? 'yes' : 'no'}`);
-      console.log('Why:');
-      for (const reason of payload.consultation.researchDecision.rationale) {
-        console.log(`- ${reason}`);
-      }
-      console.log('Recommended approach:');
-      for (const line of payload.consultation.synthesis.recommendedProjectApproach) {
-        console.log(`- ${line}`);
-      }
-      if (payload.consultation.researchPlan.sourceTargets.length > 0) {
-        console.log('Sources to prioritize:');
-        for (const source of payload.consultation.researchPlan.sourceTargets) {
-          console.log(`- ${source.tier} | ${source.label} | ${source.reason}`);
+      case 'scan': {
+        const payload = await runScan(baseOptions);
+        console.log(`Scan completed at ${payload.scanResult.completedAt}`);
+        console.log(`Projects scanned: ${payload.scanResult.projects.length}`);
+        console.log(`Changed projects: ${payload.changedProjects.join(', ') || 'none'}`);
+        if (payload.scanResult.failures.length > 0) {
+          console.log(`Failures: ${payload.scanResult.failures.length}`);
         }
+        return;
       }
-      return;
-    }
-    case 'learn': {
-      const payload = await runLearn(baseOptions);
-      console.log(`Learn completed at ${payload.state.lastLearnAt}`);
-      console.log(`Projects included: ${payload.projects.map((project) => project.name).join(', ') || 'none'}`);
-      return;
-    }
-    case 'doctor': {
-      const payload = await runDoctor(baseOptions);
-      console.log(payload.summary);
-      if (payload.warnings.length > 0) {
-        console.log('Warnings:');
-        for (const warning of payload.warnings) {
-          console.log(`- ${warning}`);
+      case 'sync': {
+        const payload = await runSync(baseOptions);
+        console.log(`Sync completed at ${payload.syncSummary.completedAt}`);
+        console.log(`Updated projects: ${payload.syncSummary.updatedProjects.join(', ') || 'none'}`);
+        console.log(`Unchanged projects: ${payload.syncSummary.unchangedProjects.length}`);
+        return;
+      }
+      case 'embed': {
+        const payload = await runEmbed(baseOptions);
+        console.log(`Embed completed at ${payload.state.lastEmbedAt}`);
+        console.log(`Embedded projects: ${payload.embeddedProjects.map((project) => project.name).join(', ') || 'none'}`);
+        return;
+      }
+      case 'query': {
+        const queryText = String(args.query ?? args._.slice(1).join(' ')).trim();
+        const payload = await runQuery({ ...baseOptions, queryText });
+        console.log(`Mode: ${payload.reasoning.mode}`);
+        console.log(`Related projects: ${payload.reasoning.relatedProjects.join(', ') || 'none'}`);
+        console.log('Top results:');
+        for (const result of payload.retrievalResponse.results.slice(0, 5)) {
+          console.log(`- ${result.project}/${result.noteType} | score=${result.relevanceScore} | ${result.snippet}`);
+          console.log(`  matched: ${result.whyMatched}`);
+          console.log(`  trusted: ${result.whyTrusted}`);
         }
-      }
-      if (payload.issues.length > 0) {
-        console.log('Issues:');
-        for (const issue of payload.issues) {
-          console.log(`- ${issue}`);
+        console.log('Suggestions:');
+        for (const suggestion of payload.reasoning.solutionSuggestions) {
+          console.log(`- ${suggestion}`);
         }
-        process.exitCode = 1;
+        return;
       }
-      if (payload.queryCheck) {
-        console.log(`Query smoke: ${payload.queryCheck.resultCount} result(s), note types: ${payload.queryCheck.topNoteTypes.join(', ') || 'none'}`);
+      case 'consult': {
+        const queryText = String(args.query ?? args._.slice(1).join(' ')).trim();
+        const payload = await runConsult({ ...baseOptions, queryText, currentProjectName: baseOptions.projectNames?.[0] ?? null });
+        console.log(`Mode: ${payload.consultation.mode}`);
+        console.log(`Local confidence: ${payload.consultation.localConfidence.score} (${payload.consultation.localConfidence.level})`);
+        console.log(`Web research required: ${payload.consultation.researchDecision.needsWebResearch ? 'yes' : 'no'}`);
+        console.log('Why:');
+        for (const reason of payload.consultation.researchDecision.rationale) {
+          console.log(`- ${reason}`);
+        }
+        if (payload.consultation.trustSummary?.strongestBasis?.length > 0) {
+          console.log('Trust basis:');
+          for (const reason of payload.consultation.trustSummary.strongestBasis) {
+            console.log(`- ${reason}`);
+          }
+        }
+        console.log('Recommended approach:');
+        for (const line of payload.consultation.synthesis.recommendedProjectApproach) {
+          console.log(`- ${line}`);
+        }
+        if (payload.consultation.researchPlan.sourceTargets.length > 0) {
+          console.log('Sources to prioritize:');
+          for (const source of payload.consultation.researchPlan.sourceTargets) {
+            console.log(`- ${source.tier} | ${source.label} | ${source.reason}`);
+          }
+        }
+        return;
       }
-      if (payload.consultCheck) {
-        console.log(`Consult smoke: mode=${payload.consultCheck.mode}, web research=${payload.consultCheck.needsWebResearch ? 'yes' : 'no'}`);
+      case 'learn': {
+        const payload = await runLearn(baseOptions);
+        console.log(`Learn completed at ${payload.state.lastLearnAt}`);
+        console.log(`Projects included: ${payload.projects.map((project) => project.name).join(', ') || 'none'}`);
+        return;
       }
-      if (payload.mcpHealth.ok) {
-        console.log(`MCP health: tools=${payload.mcpHealth.tools.join(', ')}`);
+      case 'doctor': {
+        const payload = await runDoctor(baseOptions);
+        console.log(payload.summary);
+        if (payload.warnings.length > 0) {
+          console.log('Warnings:');
+          for (const warning of payload.warnings) {
+            console.log(`- ${warning}`);
+          }
+        }
+        if (payload.issues.length > 0) {
+          console.log('Issues:');
+          for (const issue of payload.issues) {
+            console.log(`- ${issue}`);
+          }
+          process.exitCode = 1;
+        }
+        if (payload.queryCheck) {
+          console.log(`Query smoke: ${payload.queryCheck.resultCount} result(s), note types: ${payload.queryCheck.topNoteTypes.join(', ') || 'none'}`);
+        }
+        if (payload.consultCheck) {
+          console.log(`Consult smoke: mode=${payload.consultCheck.mode}, web research=${payload.consultCheck.needsWebResearch ? 'yes' : 'no'}`);
+        }
+        if (payload.mcpHealth.ok) {
+          console.log(`MCP health: tools=${payload.mcpHealth.tools.join(', ')}`);
+        }
+        return;
       }
-      return;
+      case 'validate-vault': {
+        const payload = await runValidateVault(baseOptions);
+        console.log(payload.reportText);
+        if (!payload.report.ok) {
+          process.exitCode = 1;
+        }
+        return;
+      }
+      case 'watch': {
+        await runWatch(baseOptions);
+        return;
+      }
+      case 'status': {
+        const payload = await runStatus(baseOptions);
+        console.log(`Config file: ${payload.config.configFilePath ?? 'none'}`);
+        console.log(`Projects root: ${payload.config.projectsRoot}`);
+        console.log(`Vault root: ${payload.config.vaultRoot}`);
+        console.log(`Data root: ${payload.config.dataRoot}`);
+        console.log(`Chroma root: ${payload.config.chromaRoot}`);
+        console.log(`Log root: ${payload.config.logRoot}`);
+        console.log(`State path: ${payload.config.statePath}`);
+        console.log(`Last scan: ${payload.state.lastScanAt ?? 'never'}`);
+        console.log(`Last sync: ${payload.state.lastSyncAt ?? 'never'}`);
+        console.log(`Last embed: ${payload.state.lastEmbedAt ?? 'never'}`);
+        console.log(`Last learn: ${payload.state.lastLearnAt ?? 'never'}`);
+        console.log(`Vector store: ${payload.vectorStatus.ok === false ? payload.vectorStatus.error : 'ready'}`);
+        console.log('Projects:');
+        for (const project of Object.values(payload.state.projects).sort((left, right) => left.name.localeCompare(right.name))) {
+          console.log(`- ${project.name} | ${project.status ?? 'unknown'} | chunks=${project.chunkCount ?? 0}`);
+        }
+        return;
+      }
+      default:
+        printUsage();
+        throw new Error(`Unknown command: ${command}`);
     }
-    case 'validate-vault': {
-      const payload = await runValidateVault(baseOptions);
-      console.log(payload.reportText);
-      if (!payload.report.ok) {
-        process.exitCode = 1;
-      }
-      return;
+  } finally {
+    if (command !== 'watch') {
+      await shutdownEmbeddingService();
     }
-    case 'watch': {
-      await runWatch(baseOptions);
-      return;
-    }
-    case 'status': {
-      const payload = await runStatus(baseOptions);
-      console.log(`Config file: ${payload.config.configFilePath ?? 'none'}`);
-      console.log(`Projects root: ${payload.config.projectsRoot}`);
-      console.log(`Vault root: ${payload.config.vaultRoot}`);
-      console.log(`Data root: ${payload.config.dataRoot}`);
-      console.log(`Chroma root: ${payload.config.chromaRoot}`);
-      console.log(`Log root: ${payload.config.logRoot}`);
-      console.log(`State path: ${payload.config.statePath}`);
-      console.log(`Last scan: ${payload.state.lastScanAt ?? 'never'}`);
-      console.log(`Last sync: ${payload.state.lastSyncAt ?? 'never'}`);
-      console.log(`Last embed: ${payload.state.lastEmbedAt ?? 'never'}`);
-      console.log(`Last learn: ${payload.state.lastLearnAt ?? 'never'}`);
-      console.log(`Vector store: ${payload.vectorStatus.ok === false ? payload.vectorStatus.error : 'ready'}`);
-      console.log('Projects:');
-      for (const project of Object.values(payload.state.projects).sort((left, right) => left.name.localeCompare(right.name))) {
-        console.log(`- ${project.name} | ${project.status ?? 'unknown'} | chunks=${project.chunkCount ?? 0}`);
-      }
-      return;
-    }
-    default:
-      printUsage();
-      throw new Error(`Unknown command: ${command}`);
   }
 }
 

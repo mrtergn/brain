@@ -8,12 +8,13 @@ Brain is a local-first developer memory runtime. It reads sibling repositories a
 | --- | --- |
 | Durable repo memory | Generate a narrow, canonical note model instead of free-form repository dumps |
 | Retrieval quality | Combine local embeddings, note-aware retrieval, and lightweight reasoning |
+| Trustworthy memory | Preserve evidence provenance from analysis through retrieval, consultation, and selective write-back |
 | Agent usability | Expose a stable `brain.*` tool contract through MCP |
 | Research control | Decide explicitly between `local-only`, `local-plus-web-assist`, and `web-first-local-adaptation` |
 | Documentation quality | Learn reusable repo-facing documentation patterns from real repository surfaces |
 | Drift prevention | Enforce the vault contract and fail fast on deprecated note surfaces |
 
-Everything else in the repository exists to support those five outcomes.
+Everything else in the repository exists to support those outcomes.
 
 ## System Boundaries
 
@@ -76,6 +77,7 @@ flowchart LR
 | `apps/mcp-server/index.mjs` | Sole MCP entrypoint and stable registration surface for `local-brain` |
 | `packages/brain-service/index.mjs` | Search, consultation, synthesis, project summary, related patterns, recent learnings, and write-back tools |
 | `packages/research/index.mjs` | Consultation mode selection, source prioritization, and memory-level guidance |
+| `packages/provenance/index.mjs` | Shared evidence model, trust scoring, source normalization, and metadata parsing |
 | `packages/obsidian-writer/canonical-writer.mjs` | Only active note writer and vault bootstrap path |
 | `packages/vault-contract/index.mjs` | Canonical note paths, cleanup rules, and validation logic |
 | `packages/vector-store/index.mjs` | Local Chroma integration |
@@ -123,7 +125,18 @@ Each project folder under `01_Projects/<ProjectName>/` is allowed exactly four m
 
 Brain does not treat documentation as a cosmetic layer outside the memory system. It analyzes repo-facing surfaces such as `README.md`, architecture and operator docs, troubleshooting docs, and agent-instruction files so future documentation work can start from local precedent.
 
-At normalization time, documentation signals and documentation patterns become part of the project snapshot. At write time, the canonical writer can synthesize those patterns into `documentation-style-patterns.md`. At retrieval time, documentation-shaped queries can surface those patterns alongside implementation learnings.
+At normalization time, documentation signals and documentation patterns become part of the project snapshot alongside evidence-driven boundary rules and validation surfaces extracted from docs, scripts, and strong operator cues. At write time, the canonical writer can synthesize those patterns into `documentation-style-patterns.md` and use the stronger boundary and validation signals inside project notes. At retrieval time, documentation-shaped queries can surface those patterns alongside implementation learnings.
+
+## Evidence Provenance Flow
+
+Brain now carries a shared provenance model, `provenance-v1`, across the strong-brain pipeline.
+
+1. Project analysis extracts evidence items from README sections, docs, agent guidance, manifests, and validation scripts.
+2. Normalization preserves those evidence items inside the project snapshot and writes compact evidence traces into the retrieval corpus.
+3. Chunking converts the strongest relevant evidence into vector metadata such as `evidenceQuality`, `confidence`, `supportCount`, `supportingSources`, and `derivedFrom`.
+4. Retrieval returns both `whyMatched` and `whyTrusted` so local search results are explainable rather than opaque.
+5. Consultation turns the top evidence into `trustSummary` and `localContext.evidenceBasis` so agents can see when local memory is strong enough and when web escalation is justified.
+6. The canonical writer only surfaces selective trust signals in human-facing notes, such as confidence and supporting evidence lines, to avoid turning the vault into a metadata dump.
 
 ## Write Path: Sync and Canonicalization
 
@@ -148,6 +161,8 @@ sequenceDiagram
 ```
 
 The sync path is not just a note writer. It also bootstraps vault folders, ensures canonical note surfaces exist, removes deprecated vault artifacts, writes managed global notes, refreshes reusable documentation-style patterns, and generates local launchers such as `run-brain.sh`, `run-brain-mcp.sh`, and `com.local.ai-brain.plist` under `data/runtime/`.
+
+The project-analysis stage is intentionally selective. It now prefers explicit boundary statements, validation commands, and strong documentation cues over generic README purpose text. If a repo does not provide evidence for a durable learning, Brain now leaves the learning surface thin instead of fabricating one from stack facts.
 
 ## Canonical Writer Path
 
@@ -183,7 +198,7 @@ sequenceDiagram
 	Research-->>Entry: mode, confidence, evidence, memory guidance
 ```
 
-`brain.query` and `brain.consult` share the same local retrieval foundation. The difference is that `brain.consult` adds research mode selection, source prioritization, and memory guidance so agents know whether they should stay local or pull in external validation. Documentation-shaped queries can also reuse cross-project documentation patterns when Brain detects that the task is about repo presentation, architecture docs, operator docs, or agent guidance.
+`brain.query` and `brain.consult` share the same local retrieval foundation. The difference is that `brain.consult` adds research mode selection, source prioritization, trust summarization, and memory guidance so agents know whether they should stay local or pull in external validation. Documentation-shaped queries can also reuse cross-project documentation patterns when Brain detects that the task is about repo presentation, architecture docs, operator docs, or agent guidance.
 
 ## Local-First and Web-Assisted Model
 
@@ -223,7 +238,7 @@ The intended agent sequence is:
 | Guardrail | What it checks |
 | --- | --- |
 | `brain:validate:vault` | Unexpected project note files, legacy markers, per-project knowledge mirrors, per-project logs, and runtime artifacts in the vault |
-| `brain:doctor` | Vault validity, knowledge model version mismatches, deprecated retrieval surfaces in chunk cache, missing embeddings, query smoke results, consult smoke behavior, and MCP tool availability |
+| `brain:doctor` | Vault validity, knowledge model version mismatches, deprecated retrieval surfaces in chunk cache, missing embeddings, provenance-aware query smoke results, consult trust-summary behavior, and MCP tool availability |
 | `brain:mcp:healthcheck` | Whether the MCP server starts cleanly and exposes the expected `brain.*` tool surface |
 
 The anti-drift model is explicit: remove deprecated artifacts before they survive into retrieval, then run smoke tests that prove the runtime still behaves the way the docs describe.

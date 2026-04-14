@@ -58,8 +58,23 @@ server.registerTool('brain.search', {
       project: z.string(),
       noteType: z.string(),
       sourcePath: z.string(),
+      sourceKind: z.string(),
       relevanceScore: z.number(),
       whyMatched: z.string(),
+      whyTrusted: z.string(),
+      knowledgeType: z.string(),
+      knowledgeStrength: z.string(),
+      evidenceQuality: z.string(),
+      confidence: z.number(),
+      supportCount: z.number(),
+      supportingSources: z.array(z.object({
+        sourcePath: z.string(),
+        sourceKind: z.string(),
+        sourceSection: z.string().nullable(),
+        excerpt: z.string(),
+      })),
+      derivedFrom: z.array(z.string()),
+      evidenceSummary: z.string(),
       snippet: z.string(),
       matchedTerms: z.array(z.string()),
     })),
@@ -129,6 +144,7 @@ server.registerTool('brain.consult', {
       relatedProjects: z.array(z.string()),
       topLocalSuggestions: z.array(z.string()),
       projectPatterns: z.array(z.string()),
+      evidenceBasis: z.array(z.string()),
       noteReferences: z.object({
         overview: z.string().nullable(),
         architecture: z.string().nullable(),
@@ -167,19 +183,47 @@ server.registerTool('brain.consult', {
       writeBackTarget: z.string(),
       rationale: z.array(z.string()),
     }),
+    trustSummary: z.object({
+      localEvidenceQuality: z.enum(['weak', 'medium', 'strong']),
+      strongestBasis: z.array(z.string()),
+      weakerAreas: z.array(z.string()),
+      usedExternalGuidance: z.boolean(),
+      usedExternalGuidanceBecause: z.string().nullable(),
+    }),
     evidence: z.object({
       topResults: z.array(z.object({
         project: z.string(),
         noteType: z.string(),
         sourcePath: z.string(),
+        sourceKind: z.string(),
         relevanceScore: z.number(),
         whyMatched: z.string(),
+        whyTrusted: z.string(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+        supportCount: z.number(),
+        supportingSources: z.array(z.object({
+          sourcePath: z.string(),
+          sourceKind: z.string(),
+          sourceSection: z.string().nullable(),
+          excerpt: z.string(),
+        })),
         snippet: z.string(),
       })),
       relatedPatterns: z.array(z.object({
         patternTitle: z.string(),
         explanation: z.string(),
         sourceProjects: z.array(z.string()),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+        supportCount: z.number(),
+        supportingEvidence: z.array(z.object({
+          sourcePath: z.string(),
+          sourceKind: z.string(),
+          sourceSection: z.string().nullable(),
+          excerpt: z.string(),
+        })),
+        whyTrusted: z.string(),
         relevanceScore: z.number(),
       })),
       recentLearnings: z.array(z.object({
@@ -188,6 +232,14 @@ server.registerTool('brain.consult', {
         title: z.string(),
         excerpt: z.string(),
         notePath: z.string(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+        supportingSources: z.array(z.object({
+          sourcePath: z.string(),
+          sourceKind: z.string(),
+          sourceSection: z.string().nullable(),
+          excerpt: z.string(),
+        })),
         updatedAt: z.string().nullable(),
       })),
     }),
@@ -312,6 +364,8 @@ server.registerTool('brain.project_summary', {
     purpose: z.string(),
     stack: z.array(z.string()),
     architecture: z.array(z.string()),
+    boundaries: z.array(z.string()),
+    validationSurfaces: z.array(z.string()),
     importantFiles: z.array(z.string()),
     importantModules: z.array(z.string()),
     relevantLearnings: z.object({
@@ -320,9 +374,94 @@ server.registerTool('brain.project_summary', {
       whyItWorked: z.array(z.string()),
       reusablePattern: z.array(z.string()),
       followUp: z.array(z.string()),
+      evidenceQuality: z.string(),
+      confidence: z.number(),
+      supportingSources: z.array(z.object({
+        sourcePath: z.string(),
+        sourceKind: z.string(),
+        sourceSection: z.string().nullable(),
+        excerpt: z.string(),
+      })),
     }),
     projectPatterns: z.array(z.string()),
     documentationPatterns: z.array(z.string()),
+    provenance: z.object({
+      purpose: z.object({
+        id: z.string(),
+        category: z.string().nullable(),
+        value: z.string(),
+        confidence: z.number(),
+        evidenceQuality: z.string(),
+        derivedFrom: z.string(),
+        supportCount: z.number(),
+        sources: z.array(z.object({
+          sourcePath: z.string(),
+          sourceKind: z.string(),
+          sourceSection: z.string().nullable(),
+          excerpt: z.string(),
+        })),
+      }).nullable(),
+      boundaries: z.array(z.object({
+        id: z.string(),
+        category: z.string().nullable(),
+        value: z.string(),
+        confidence: z.number(),
+        evidenceQuality: z.string(),
+        derivedFrom: z.string(),
+        supportCount: z.number(),
+        sources: z.array(z.object({
+          sourcePath: z.string(),
+          sourceKind: z.string(),
+          sourceSection: z.string().nullable(),
+          excerpt: z.string(),
+        })),
+      })),
+      validationSurfaces: z.array(z.object({
+        id: z.string(),
+        category: z.string().nullable(),
+        value: z.string(),
+        confidence: z.number(),
+        evidenceQuality: z.string(),
+        derivedFrom: z.string(),
+        supportCount: z.number(),
+        sources: z.array(z.object({
+          sourcePath: z.string(),
+          sourceKind: z.string(),
+          sourceSection: z.string().nullable(),
+          excerpt: z.string(),
+        })),
+      })),
+      reusableSolutions: z.array(z.object({
+        id: z.string(),
+        category: z.string().nullable(),
+        value: z.string(),
+        confidence: z.number(),
+        evidenceQuality: z.string(),
+        derivedFrom: z.string(),
+        supportCount: z.number(),
+        sources: z.array(z.object({
+          sourcePath: z.string(),
+          sourceKind: z.string(),
+          sourceSection: z.string().nullable(),
+          excerpt: z.string(),
+        })),
+      })),
+      documentationPatterns: z.array(z.object({
+        id: z.string(),
+        category: z.string().nullable(),
+        value: z.string(),
+        confidence: z.number(),
+        evidenceQuality: z.string(),
+        derivedFrom: z.string(),
+        supportCount: z.number(),
+        sources: z.array(z.object({
+          sourcePath: z.string(),
+          sourceKind: z.string(),
+          sourceSection: z.string().nullable(),
+          excerpt: z.string(),
+        })),
+      })),
+    }),
     noteReferences: z.object({
       overview: z.string(),
       architecture: z.string(),
@@ -366,6 +505,16 @@ server.registerTool('brain.related_patterns', {
       explanation: z.string(),
       sourceProjects: z.array(z.string()),
       whereUsedBefore: z.array(z.string()),
+      supportingEvidence: z.array(z.object({
+        sourcePath: z.string(),
+        sourceKind: z.string(),
+        sourceSection: z.string().nullable(),
+        excerpt: z.string(),
+      })),
+      evidenceQuality: z.string(),
+      confidence: z.number(),
+      supportCount: z.number(),
+      whyTrusted: z.string(),
       relevanceScore: z.number(),
     })),
   },
@@ -403,6 +552,14 @@ server.registerTool('brain.recent_learnings', {
       title: z.string(),
       excerpt: z.string(),
       notePath: z.string(),
+      evidenceQuality: z.string(),
+      confidence: z.number(),
+      supportingSources: z.array(z.object({
+        sourcePath: z.string(),
+        sourceKind: z.string(),
+        sourceSection: z.string().nullable(),
+        excerpt: z.string(),
+      })),
       updatedAt: z.string().nullable(),
     })),
   },
@@ -546,6 +703,7 @@ function renderSearchText(payload) {
   ];
   for (const result of payload.results.slice(0, 6)) {
     lines.push(`- ${result.project}/${result.noteType} | score=${result.relevanceScore} | ${result.whyMatched}`);
+    lines.push(`  trust: ${result.whyTrusted}`);
     lines.push(`  ${result.snippet}`);
   }
   if (payload.relatedPatterns.length > 0) {
@@ -574,6 +732,13 @@ function renderConsultationText(payload) {
   lines.push('Local signals:');
   for (const item of payload.synthesis.whatLocalSuggests.slice(0, 4)) {
     lines.push(`- ${item}`);
+  }
+  if (payload.trustSummary.strongestBasis.length > 0) {
+    lines.push('');
+    lines.push('Trust basis:');
+    for (const item of payload.trustSummary.strongestBasis.slice(0, 3)) {
+      lines.push(`- ${item}`);
+    }
   }
   if (payload.researchDecision.needsWebResearch) {
     lines.push('');
@@ -626,13 +791,14 @@ function renderProjectSummaryText(payload) {
     `Architecture: ${payload.architecture.slice(0, 4).join('; ')}`,
     `Problem: ${payload.relevantLearnings.problem}`,
     `Reusable pattern: ${payload.relevantLearnings.reusablePattern.slice(0, 2).join('; ')}`,
+    `Learning trust: ${payload.relevantLearnings.evidenceQuality} ${payload.relevantLearnings.confidence}`,
   ].join('\n');
 }
 
 function renderPatternText(payload) {
   const lines = [`Patterns for: ${payload.query}`];
   for (const pattern of payload.patterns) {
-    lines.push(`- ${pattern.patternTitle} | score=${pattern.relevanceScore} | projects: ${pattern.sourceProjects.join(', ')}`);
+    lines.push(`- ${pattern.patternTitle} | score=${pattern.relevanceScore} | projects: ${pattern.sourceProjects.join(', ')} | trust: ${pattern.evidenceQuality} ${pattern.confidence}`);
   }
   return lines.join('\n');
 }
@@ -640,7 +806,7 @@ function renderPatternText(payload) {
 function renderRecentLearningsText(payload) {
   const lines = [`Recent learnings (${payload.category})`];
   for (const item of payload.items) {
-    lines.push(`- ${item.title} | ${item.excerpt}`);
+    lines.push(`- ${item.title} | ${item.excerpt} | trust: ${item.evidenceQuality} ${item.confidence}`);
   }
   return lines.join('\n');
 }

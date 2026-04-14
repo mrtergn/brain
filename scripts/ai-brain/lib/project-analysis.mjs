@@ -2,6 +2,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+import {
+  createEvidenceItem,
+  createEvidenceSource,
+  EVIDENCE_MODEL_VERSION,
+  evidenceItemsToValues,
+  mergeEvidenceItems,
+} from '../../../packages/provenance/index.mjs';
+
 const SOURCE_EXTENSIONS = new Map([
   ['.ts', 'TypeScript'],
   ['.tsx', 'TypeScript'],
@@ -142,6 +150,10 @@ const CSPROJ_PATTERN = /\.csproj$/i;
 
 const MAX_READ_SIZE_BYTES = 128 * 1024;
 
+const BOUNDARY_SIGNAL_PATTERN = /(read-only|local-first|local only|runtime state|vault|repo-local|global state|artifact|evidence|operator|boundary|contract|constraint|deterministic|snapshot|rewind|plugin|secret|keep\b|preserve\b|limit\b|only\b|must\b|must not|do not|should not|avoid\b|lives under|belongs under|stays under|remain under|instead of|without\b)/i;
+const VALIDATION_SIGNAL_PATTERN = /(test|tests|spec|lint|check|validate|validation|verify|doctor|healthcheck|smoke|embed|sync|consult|query|build)/i;
+const LEARNING_HEADING_PATTERN = /boundary|boundaries|constraint|constraints|rules|guardrails|troubleshooting|recovery|pitfall|lessons|workflow|operator|safety/i;
+
 const JS_FRAMEWORKS = new Map([
   ['next', 'Next.js'],
   ['react', 'React'],
@@ -227,6 +239,18 @@ export async function analyzeProject(projectRoot, options = {}) {
     packageFacts,
     directories: walked.topDirectories,
     techStack,
+    readme,
+    documents,
+  });
+  const boundaryRules = deriveBoundaryRules({
+    readme,
+    documents,
+    architecturePatterns,
+  });
+  const validationSurfaces = deriveValidationSurfaces({
+    readme,
+    documents,
+    packageFacts,
   });
   const potentialImprovements = derivePotentialImprovements({
     walked,
@@ -240,6 +264,24 @@ export async function analyzeProject(projectRoot, options = {}) {
   });
   const documentationQualitySignals = deriveDocumentationQualitySignals(documentationSurface);
   const documentationPatterns = deriveDocumentationPatterns(documentationSurface);
+  const provenance = buildAnalysisProvenance({
+    projectName,
+    projectRoot,
+    purpose,
+    documents,
+    readme,
+    packageFacts,
+    walked,
+    techStack,
+    architecturePatterns,
+    problemsSolved,
+    reusablePatterns,
+    boundaryRules,
+    validationSurfaces,
+    documentationQualitySignals,
+    documentationPatterns,
+    documentationSurface,
+  });
   const documentationPaths = uniqueStrings(
     documents
       .filter((document) => document.kind === 'readme' || document.kind === 'doc')
@@ -272,6 +314,7 @@ export async function analyzeProject(projectRoot, options = {}) {
     name: projectName,
     rootPath: projectRoot,
     relativeRoot: projectName,
+    evidenceModelVersion: EVIDENCE_MODEL_VERSION,
     fingerprint: createFingerprint({
       files: walked.files,
       directories: walked.topDirectories,
@@ -286,8 +329,11 @@ export async function analyzeProject(projectRoot, options = {}) {
     architecturePatterns,
     problemsSolved,
     reusablePatterns,
+    boundaryRules,
+    validationSurfaces,
     documentationQualitySignals,
     documentationPatterns,
+    provenance,
     documentationQualityScore: documentationSurface.qualityScore,
     potentialImprovements,
     dependencies: dependencyNames,
@@ -470,6 +516,7 @@ async function loadDocuments(projectRoot, interestingFiles, maxReadmeDocuments) 
       text,
       headings: extractMarkdownHeadings(text),
       excerpt: extractExcerpt(text),
+      sections: extractDocumentSections(text),
     });
   }
   return loaded;
@@ -477,6 +524,8 @@ async function loadDocuments(projectRoot, interestingFiles, maxReadmeDocuments) 
 
 async function collectPackageFacts(documents) {
   const javascriptDependencies = new Set();
+  const javascriptScripts = [];
+  const javascriptScriptEntries = [];
   const pythonDependencies = new Set();
   const goDependencies = new Set();
   const rustDependencies = new Set();
@@ -496,6 +545,21 @@ async function collectPackageFacts(documents) {
         collectObjectKeys(javascriptDependencies, payload.peerDependencies);
         if (typeof payload.description === 'string') {
           descriptions.push(payload.description.trim());
+        }
+        if (payload.scripts && typeof payload.scripts === 'object') {
+          for (const [name, command] of Object.entries(payload.scripts)) {
+            if (typeof command === 'string' && command.trim()) {
+              javascriptScripts.push(`${name}: ${command.trim()}`);
+              javascriptScriptEntries.push({
+                name,
+                command: command.trim(),
+                sourcePath: document.relativePath,
+                sourceKind: 'manifest',
+                sourceSection: 'scripts',
+                excerpt: `${name}: ${command.trim()}`,
+              });
+            }
+          }
         }
         if (payload.packageManager) {
           runtimeSignals.add(String(payload.packageManager));
@@ -561,7 +625,11 @@ async function collectPackageFacts(documents) {
   return {
     descriptions: uniqueStrings(descriptions).filter(Boolean),
     runtimeSignals: uniqueStrings([...runtimeSignals]),
-    javascript: { dependencies: uniqueStrings([...javascriptDependencies]) },
+    javascript: {
+      dependencies: uniqueStrings([...javascriptDependencies]),
+      scripts: uniqueStrings(javascriptScripts),
+      scriptEntries: javascriptScriptEntries,
+    },
     python: { dependencies: uniqueStrings([...pythonDependencies]) },
     go: { dependencies: uniqueStrings([...goDependencies]) },
     rust: { dependencies: uniqueStrings([...rustDependencies]) },
@@ -734,22 +802,27 @@ function deriveArchitecturePatterns({ projectName, directories, packageFacts, fi
 }
 
 function deriveProblemsSolved(readme, purpose, projectName) {
+  const repoSignals = [readme].filter(Boolean);
   const candidates = uniqueStrings([
-    normalizeProblemCandidate(purpose),
-    ...extractDescriptiveSentences(readme?.text ?? '').map((candidate) => normalizeProblemCandidate(candidate)),
-    ...extractBulletStatements(readme?.text ?? '').map((candidate) => normalizeProblemCandidate(candidate)),
-  ]).filter((candidate) => isUsefulProblemCandidate(candidate, projectName));
+    ...repoSignals.flatMap((document) => extractBulletStatements(document?.text ?? '')),
+    ...repoSignals.flatMap((document) => extractDescriptiveSentences(document?.text ?? '')),
+  ])
+    .map((candidate) => normalizeProblemCandidate(candidate))
+    .filter((candidate) => isUsefulProblemCandidate(candidate, projectName) && isHighSignalProblemCandidate(candidate));
   if (candidates.length > 0) {
     return candidates.slice(0, 4);
   }
-  const headings = (readme?.headings ?? []).filter((heading) => !/^readme$/i.test(heading)).slice(0, 3);
+  const headings = (readme?.headings ?? [])
+    .filter((heading) => !/^readme$/i.test(heading))
+    .filter((heading) => LEARNING_HEADING_PATTERN.test(heading))
+    .slice(0, 3);
   if (headings.length > 0) {
     return headings.map((heading) => `${projectName} addresses the concern described under “${heading}”.`);
   }
-  return [normalizeProblemCandidate(purpose) || `${projectName} captures reusable project knowledge inside the repository.`];
+  return [];
 }
 
-function deriveReusablePatterns({ architecturePatterns, packageFacts, directories, techStack }) {
+function deriveReusablePatterns({ architecturePatterns, packageFacts, directories, techStack, readme, documents }) {
   const patterns = new Set();
   for (const architecturePattern of architecturePatterns) {
     if (/monorepo/i.test(architecturePattern)) {
@@ -777,10 +850,56 @@ function deriveReusablePatterns({ architecturePatterns, packageFacts, directorie
   if (packageFacts.javascript.dependencies.length > 0 && directories.some((directory) => directory.startsWith('packages/'))) {
     patterns.add('Use package-level ownership to capture reusable services, UI primitives, or automation helpers.');
   }
-  if (patterns.size === 0) {
-    patterns.add('Capture repeatable implementation decisions in dedicated notes so future agents can reuse them quickly.');
+
+  for (const candidate of uniqueStrings([
+    ...extractBulletStatements(readme?.text ?? ''),
+    ...documents.flatMap((document) => extractBulletStatements(document.text ?? '')),
+  ])) {
+    const normalized = normalizeProblemCandidate(candidate);
+    if (isHighSignalPatternCandidate(normalized)) {
+      patterns.add(ensureTrailingPeriod(normalized));
+    }
   }
+
   return uniqueStrings([...patterns]).slice(0, 8);
+}
+
+function deriveBoundaryRules({ readme, documents, architecturePatterns }) {
+  const candidates = uniqueStrings([
+    ...extractBulletStatements(readme?.text ?? ''),
+    ...extractDescriptiveSentences(readme?.text ?? ''),
+    ...documents.flatMap((document) => extractBulletStatements(document.text ?? '')),
+    ...documents.flatMap((document) => extractDescriptiveSentences(document.text ?? '')),
+  ])
+    .map((candidate) => normalizeProblemCandidate(candidate))
+    .filter((candidate) => isHighSignalBoundaryCandidate(candidate));
+
+  if (candidates.length > 0) {
+    return candidates.slice(0, 8).map((candidate) => ensureTrailingPeriod(candidate));
+  }
+
+  const inferred = [];
+  if (architecturePatterns.some((pattern) => /docs-as-code/i.test(pattern))) {
+    inferred.push('Treat docs as part of the operating surface, not as optional afterthoughts.');
+  }
+  if (architecturePatterns.some((pattern) => /automation-first/i.test(pattern))) {
+    inferred.push('Keep repeated operator workflows explicit and scriptable instead of relying on ad hoc local steps.');
+  }
+  return inferred.slice(0, 4);
+}
+
+function deriveValidationSurfaces({ readme, documents, packageFacts }) {
+  const commands = uniqueStrings([
+    ...extractShellCommands(readme?.text ?? ''),
+    ...documents.flatMap((document) => extractShellCommands(document.text ?? '')),
+    ...(packageFacts.javascript.scripts ?? [])
+      .filter((entry) => VALIDATION_SIGNAL_PATTERN.test(entry))
+      .map((entry) => `Package script: ${entry}`),
+  ])
+    .map((entry) => normalizeProblemCandidate(entry))
+    .filter((entry) => isUsefulValidationSurface(entry));
+
+  return commands.slice(0, 8);
 }
 
 function derivePotentialImprovements({ walked, readme, packageFacts, architecturePatterns }) {
@@ -923,6 +1042,777 @@ function deriveDocumentationPatterns(surface) {
     patterns.add('Progressive disclosure pattern: hide secondary commands or file layouts behind details blocks so the main README stays tight.');
   }
   return uniqueStrings([...patterns]).slice(0, 8);
+}
+
+function buildAnalysisProvenance({
+  projectName,
+  projectRoot,
+  purpose,
+  documents,
+  readme,
+  packageFacts,
+  walked,
+  techStack,
+  architecturePatterns,
+  problemsSolved,
+  reusablePatterns,
+  boundaryRules,
+  validationSurfaces,
+  documentationQualitySignals,
+  documentationPatterns,
+  documentationSurface,
+}) {
+  const architecture = buildArchitectureProvenance({
+    projectRoot,
+    documents,
+    packageFacts,
+    directories: walked.topDirectories,
+    files: walked.files,
+    techStack,
+    architecturePatterns,
+  });
+
+  return {
+    purpose: buildPurposeProvenance({
+      purpose,
+      projectRoot,
+      documents,
+      readme,
+      packageFacts,
+    }),
+    architecture,
+    recurringProblems: buildDocumentMatchedEvidence({
+      category: 'recurringProblems',
+      values: problemsSolved,
+      documents: readme ? [readme] : documents.filter((document) => document.kind === 'readme' || document.kind === 'doc'),
+      fallbackDerivedFrom: 'heuristic-inference',
+    }),
+    reusableSolutions: buildReusablePatternProvenance({
+      reusablePatterns,
+      architecture,
+      documents,
+      directories: walked.topDirectories,
+      files: walked.files,
+      packageFacts,
+    }),
+    boundaryRules: buildBoundaryRuleProvenance({
+      boundaryRules,
+      documents,
+      architecture,
+    }),
+    validationSurfaces: buildValidationSurfaceProvenance({
+      validationSurfaces,
+      documents,
+      packageFacts,
+    }),
+    documentationQualitySignals: buildDocumentationQualitySignalProvenance({
+      documentationQualitySignals,
+      documentationSurface,
+    }),
+    documentationPatterns: buildDocumentationPatternProvenance({
+      documentationPatterns,
+      documentationSurface,
+    }),
+  };
+}
+
+function buildPurposeProvenance({ purpose, projectRoot, documents, readme, packageFacts }) {
+  const normalizedPurpose = normalizeProblemCandidate(purpose);
+  const readmeSource = readme?.excerpt
+    ? createEvidenceSource({
+      sourcePath: readme.relativePath,
+      sourceKind: readme.kind,
+      sourceSection: readme.sections?.[0]?.heading ?? 'opening',
+      excerpt: readme.excerpt,
+    })
+    : null;
+  const description = packageFacts.descriptions.find(Boolean) ?? '';
+  const descriptionDocument = description
+    ? documents.find((document) => document.text.includes(description))
+    : null;
+  const descriptionSource = descriptionDocument
+    ? createEvidenceSource({
+      sourcePath: descriptionDocument.relativePath,
+      sourceKind: descriptionDocument.kind,
+      sourceSection: 'description',
+      excerpt: description,
+    })
+    : null;
+
+  return createEvidenceItem({
+    category: 'purpose',
+    value: normalizedPurpose,
+    sources: [readmeSource, descriptionSource].filter(Boolean),
+    derivedFrom: readmeSource
+      ? 'readme-excerpt'
+      : (descriptionSource ? 'package-manifest' : 'heuristic-fallback'),
+    confidence: readmeSource || descriptionSource ? undefined : 0.34,
+    evidenceQuality: readmeSource || descriptionSource ? undefined : 'weak',
+  }) ?? createEvidenceItem({
+    category: 'purpose',
+    value: `${path.basename(projectRoot)} purpose could not be supported by README or manifest evidence.`,
+    sources: [],
+    derivedFrom: 'heuristic-fallback',
+    confidence: 0.34,
+    evidenceQuality: 'weak',
+  });
+}
+
+function buildArchitectureProvenance({ projectRoot, documents, packageFacts, directories, files, techStack, architecturePatterns }) {
+  const items = [];
+  const packageJsonSource = findDocumentByName(documents, 'package.json');
+  const docsSource = findDirectorySource(directories, /^docs(?:\/|$)/i, 'Detected docs/ as a first-class repository surface.');
+
+  for (const pattern of architecturePatterns) {
+    if (/Monorepo with separate app and package boundaries/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'directory-layout',
+        sources: [
+          findDirectorySource(directories, /^apps(?:\/|$)/i, 'Detected apps/ top-level boundary.'),
+          findDirectorySource(directories, /^(packages|libs)(?:\/|$)/i, 'Detected packages/ or libs/ top-level boundary.'),
+        ].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/Explicit frontend and backend split/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'directory-layout',
+        sources: [
+          findDirectorySource(directories, /^frontend(?:\/|$)/i, 'Detected frontend/ top-level boundary.'),
+          findDirectorySource(directories, /^backend(?:\/|$)/i, 'Detected backend/ top-level boundary.'),
+        ].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/Product surfaces documented alongside implementation code/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'directory-layout',
+        sources: [
+          findDirectorySource(directories, /^apps(?:\/|$)/i, 'Detected apps/ product surface.'),
+          docsSource,
+        ].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/Plugin or extension surface/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'directory-layout',
+        sources: [findDirectorySource(directories, /^plugins(?:\/|$)/i, 'Detected plugins/ extension surface.')].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/Automation-first workflow with scriptable entrypoints/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'directory-layout',
+        sources: [
+          findDirectorySource(directories, /^scripts(?:\/|$)/i, 'Detected scripts/ operator surface.'),
+          findDirectorySource(directories, /^cli(?:\/|$)/i, 'Detected cli/ entry surface.'),
+          packageJsonSource
+            ? createEvidenceSource({
+              sourcePath: packageJsonSource.relativePath,
+              sourceKind: packageJsonSource.kind,
+              sourceSection: 'scripts',
+              excerpt: 'package.json exposes runnable operator scripts.',
+            })
+            : null,
+        ].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/verification or test surfaces/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'directory-layout',
+        sources: [
+          findDirectorySource(directories, /(?:^|\/)(tests|test|__tests__|spec|specs)(?:\/|$)/i, 'Detected tests/ or specs/ verification surface.'),
+          packageJsonSource
+            ? createEvidenceSource({
+              sourcePath: packageJsonSource.relativePath,
+              sourceKind: packageJsonSource.kind,
+              sourceSection: 'scripts',
+              excerpt: 'package.json includes test-like scripts or validation tasks.',
+            })
+            : null,
+        ].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/Docs-as-code knowledge capture inside the repository/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'doc-structure',
+        sources: [
+          docsSource,
+          ...documents
+            .filter((document) => document.kind === 'doc')
+            .slice(0, 2)
+            .map((document) => createEvidenceSource({
+              sourcePath: document.relativePath,
+              sourceKind: document.kind,
+              sourceSection: document.sections?.[0]?.heading ?? 'opening',
+              excerpt: document.excerpt,
+            })),
+        ].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/Component-driven frontend architecture/i.test(pattern) && packageJsonSource) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'package-manifest',
+        sources: [createEvidenceSource({
+          sourcePath: packageJsonSource.relativePath,
+          sourceKind: packageJsonSource.kind,
+          sourceSection: 'dependencies',
+          excerpt: `Detected frontend stack signals in package.json: ${techStack.filter((item) => /React|Next\.js|Vue|Svelte/i.test(item)).join(', ')}`,
+        })],
+      }));
+      continue;
+    }
+    if (/Desktop shell layered on top of shared application runtime/i.test(pattern) && packageJsonSource) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'package-manifest',
+        sources: [createEvidenceSource({
+          sourcePath: packageJsonSource.relativePath,
+          sourceKind: packageJsonSource.kind,
+          sourceSection: 'dependencies',
+          excerpt: 'Detected Electron dependency in package.json.',
+        })],
+      }));
+      continue;
+    }
+    if (/Unity game project structure/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'directory-layout',
+        sources: [
+          findDirectorySource(directories, /^Assets(?:\/|$)/, 'Detected Unity Assets/ directory.'),
+          findDirectorySource(directories, /^ProjectSettings(?:\/|$)/, 'Detected Unity ProjectSettings/ directory.'),
+          findFileSource(files, 'ProjectVersion.txt', 'Detected Unity ProjectVersion.txt runtime marker.'),
+        ].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/Cross-platform client project with shared Dart code/i.test(pattern)) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'package-manifest',
+        sources: [
+          findFileSource(files, 'pubspec.yaml', 'Detected Flutter/Dart entry manifest.'),
+          findDirectorySource(directories, /^ios(?:\/|$)/i, 'Detected iOS platform shell.'),
+          findDirectorySource(directories, /^android(?:\/|$)/i, 'Detected Android platform shell.'),
+        ].filter(Boolean),
+      }));
+      continue;
+    }
+    if (/Local developer workflow backed by automated validation tools/i.test(pattern) && packageJsonSource) {
+      items.push(createEvidenceItem({
+        category: 'architecture',
+        value: pattern,
+        derivedFrom: 'package-manifest',
+        sources: [createEvidenceSource({
+          sourcePath: packageJsonSource.relativePath,
+          sourceKind: packageJsonSource.kind,
+          sourceSection: 'dependencies',
+          excerpt: 'Detected test-tool dependencies such as vitest or playwright in package.json.',
+        })],
+      }));
+      continue;
+    }
+
+    items.push(createEvidenceItem({
+      category: 'architecture',
+      value: pattern,
+      derivedFrom: 'heuristic-inference',
+      sources: [createEvidenceSource({
+        sourcePath: path.basename(projectRoot),
+        sourceKind: 'directory',
+        sourceSection: 'scan',
+        excerpt: `Inferred from repository layout and stack: ${pattern}`,
+      })],
+    }));
+  }
+
+  return mergeEvidenceItems(items).slice(0, 8);
+}
+
+function buildReusablePatternProvenance({ reusablePatterns, architecture, documents, directories, files, packageFacts }) {
+  const architectureByValue = new Map((architecture ?? []).map((item) => [item.value, item]));
+  const items = [];
+
+  for (const pattern of reusablePatterns) {
+    let derivedFrom = 'explicit-doc';
+    let sources = findBestEvidenceSourcesForValue(pattern, documents);
+
+    if (/Use modular folders and shared packages/i.test(pattern)) {
+      sources = architectureByValue.get('Monorepo with separate app and package boundaries')?.sources ?? sources;
+      derivedFrom = 'directory-layout';
+    } else if (/Keep UI and service concerns isolated/i.test(pattern)) {
+      sources = architectureByValue.get('Explicit frontend and backend split')?.sources ?? sources;
+      derivedFrom = 'directory-layout';
+    } else if (/Expose a controlled extension surface/i.test(pattern)) {
+      sources = architectureByValue.get('Plugin or extension surface for local customization')?.sources ?? sources;
+      derivedFrom = 'directory-layout';
+    } else if (/Encode repeated workflows as local scripts/i.test(pattern)) {
+      sources = architectureByValue.get('Automation-first workflow with scriptable entrypoints')?.sources ?? sources;
+      derivedFrom = 'directory-layout';
+    } else if (/Store architecture and operating knowledge next to implementation/i.test(pattern)) {
+      sources = architectureByValue.get('Docs-as-code knowledge capture inside the repository')?.sources ?? sources;
+      derivedFrom = 'doc-structure';
+    } else if (/Separate gameplay assets, packages, and editor settings/i.test(pattern)) {
+      sources = [
+        findDirectorySource(directories, /^Assets(?:\/|$)/, 'Detected Unity Assets/ game content boundary.'),
+        findDirectorySource(directories, /^ProjectSettings(?:\/|$)/, 'Detected Unity ProjectSettings/ editor configuration boundary.'),
+      ].filter(Boolean);
+      derivedFrom = 'directory-layout';
+    } else if (/Share client logic in Dart/i.test(pattern)) {
+      sources = [
+        findFileSource(files, 'pubspec.yaml', 'Flutter manifest anchors shared client logic.'),
+        findDirectorySource(directories, /^ios(?:\/|$)/i, 'Detected iOS shell.'),
+        findDirectorySource(directories, /^android(?:\/|$)/i, 'Detected Android shell.'),
+      ].filter(Boolean);
+      derivedFrom = 'package-manifest';
+    } else if (/Use package-level ownership/i.test(pattern)) {
+      sources = [findDirectorySource(directories, /^packages(?:\/|$)/i, 'Detected packages/ reusable ownership boundary.')].filter(Boolean);
+      derivedFrom = 'directory-layout';
+    } else if (sources.length === 0 && packageFacts.javascript.scriptEntries.length > 0 && /script|workflow|operator|validate/i.test(pattern)) {
+      sources = packageFacts.javascript.scriptEntries.slice(0, 2).map((entry) => createEvidenceSource(entry));
+      derivedFrom = 'manifest-script';
+    }
+
+    items.push(createEvidenceItem({
+      category: 'reusableSolutions',
+      value: pattern,
+      sources,
+      derivedFrom: sources.length > 0 ? derivedFrom : 'heuristic-inference',
+      confidence: sources.length > 0 ? undefined : 0.52,
+      evidenceQuality: sources.length > 0 ? undefined : 'weak',
+    }));
+  }
+
+  return mergeEvidenceItems(items).slice(0, 8);
+}
+
+function buildBoundaryRuleProvenance({ boundaryRules, documents, architecture }) {
+  const architectureByValue = new Map((architecture ?? []).map((item) => [item.value, item]));
+  const items = [];
+
+  for (const rule of boundaryRules) {
+    let sources = findBestEvidenceSourcesForValue(rule, documents.filter((document) => document.kind === 'readme' || document.kind === 'doc' || /AGENTS|CLAUDE|copilot-instructions/i.test(document.relativePath)));
+    let derivedFrom = sources.length > 0 ? 'explicit-doc' : 'heuristic-inference';
+
+    if (sources.length === 0 && /Treat docs as part of the operating surface/i.test(rule)) {
+      sources = architectureByValue.get('Docs-as-code knowledge capture inside the repository')?.sources ?? [];
+      derivedFrom = 'doc-structure';
+    }
+    if (sources.length === 0 && /Keep repeated operator workflows explicit and scriptable/i.test(rule)) {
+      sources = architectureByValue.get('Automation-first workflow with scriptable entrypoints')?.sources ?? [];
+      derivedFrom = 'directory-layout';
+    }
+
+    items.push(createEvidenceItem({
+      category: 'boundaryRules',
+      value: rule,
+      sources,
+      derivedFrom,
+      confidence: sources.length > 0 ? undefined : 0.48,
+      evidenceQuality: sources.length > 0 ? undefined : 'weak',
+    }));
+  }
+
+  return mergeEvidenceItems(items).slice(0, 8);
+}
+
+function buildValidationSurfaceProvenance({ validationSurfaces, documents, packageFacts }) {
+  const items = [];
+  for (const surface of validationSurfaces) {
+    const scriptEntry = packageFacts.javascript.scriptEntries.find((entry) => surface.includes(`${entry.name}: ${entry.command}`));
+    const sources = scriptEntry
+      ? [createEvidenceSource(scriptEntry)]
+      : findBestEvidenceSourcesForValue(surface, documents, { candidateKinds: ['command'] });
+    items.push(createEvidenceItem({
+      category: 'validationSurfaces',
+      value: surface,
+      sources,
+      derivedFrom: scriptEntry ? 'manifest-script' : (sources.length > 0 ? 'explicit-doc' : 'heuristic-inference'),
+      confidence: sources.length > 0 ? undefined : 0.5,
+      evidenceQuality: sources.length > 0 ? undefined : 'weak',
+    }));
+  }
+  return mergeEvidenceItems(items).slice(0, 8);
+}
+
+function buildDocumentationQualitySignalProvenance({ documentationQualitySignals, documentationSurface }) {
+  const items = [];
+  for (const signal of documentationQualitySignals) {
+    items.push(createEvidenceItem({
+      category: 'documentationQualitySignals',
+      value: signal,
+      sources: resolveDocumentationSourcesForSignal(signal, documentationSurface),
+      derivedFrom: 'doc-structure',
+    }));
+  }
+  return mergeEvidenceItems(items).slice(0, 8);
+}
+
+function buildDocumentationPatternProvenance({ documentationPatterns, documentationSurface }) {
+  const items = [];
+  for (const pattern of documentationPatterns) {
+    items.push(createEvidenceItem({
+      category: 'documentationPatterns',
+      value: pattern,
+      sources: resolveDocumentationSourcesForPattern(pattern, documentationSurface),
+      derivedFrom: 'doc-structure',
+    }));
+  }
+  return mergeEvidenceItems(items).slice(0, 8);
+}
+
+function buildDocumentMatchedEvidence({ category, values, documents, fallbackDerivedFrom = 'heuristic-inference' }) {
+  return mergeEvidenceItems(values.map((value) => {
+    const sources = findBestEvidenceSourcesForValue(value, documents);
+    return createEvidenceItem({
+      category,
+      value,
+      sources,
+      derivedFrom: sources.length > 0 ? 'explicit-doc' : fallbackDerivedFrom,
+      confidence: sources.length > 0 ? undefined : 0.46,
+      evidenceQuality: sources.length > 0 ? undefined : 'weak',
+    });
+  })).slice(0, 8);
+}
+
+function findBestEvidenceSourcesForValue(value, documents, { candidateKinds = ['bullet', 'sentence', 'heading', 'command'], maxSources = 2, minScore = 0.28 } = {}) {
+  const candidates = collectEvidenceCandidates(documents, { candidateKinds });
+  const scored = candidates
+    .map((candidate) => ({
+      candidate,
+      score: scoreEvidenceCandidate(value, candidate.value),
+    }))
+    .filter((entry) => entry.score >= minScore)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, maxSources)
+    .map((entry) => createEvidenceSource(entry.candidate));
+
+  return scored;
+}
+
+function collectEvidenceCandidates(documents, { candidateKinds = ['bullet', 'sentence', 'heading', 'command'] } = {}) {
+  const candidates = [];
+  for (const document of documents.filter(Boolean)) {
+    if (candidateKinds.includes('heading')) {
+      for (const section of document.sections ?? []) {
+        if (!section.heading) {
+          continue;
+        }
+        candidates.push({
+          sourcePath: document.relativePath,
+          sourceKind: document.kind,
+          sourceSection: section.heading,
+          excerpt: section.heading,
+          value: normalizeProblemCandidate(section.heading),
+        });
+      }
+    }
+
+    for (const section of document.sections ?? []) {
+      if (candidateKinds.includes('bullet')) {
+        for (const rawLine of String(section.text ?? '').split('\n')) {
+          if (!/^[-*]\s+/.test(rawLine.trim()) && !/^\d+\.\s+/.test(rawLine.trim())) {
+            continue;
+          }
+          const value = normalizeProblemCandidate(rawLine.replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, '').trim());
+          if (!value) {
+            continue;
+          }
+          candidates.push({
+            sourcePath: document.relativePath,
+            sourceKind: document.kind,
+            sourceSection: section.heading,
+            excerpt: value,
+            value,
+          });
+        }
+      }
+
+      if (candidateKinds.includes('sentence')) {
+        for (const sentence of markdownToText(section.text ?? '')
+          .replace(/\n+/g, ' ')
+          .split(/[.!?]\s+/)
+          .map((entry) => normalizeProblemCandidate(entry))) {
+          if (!sentence || sentence.length < 24) {
+            continue;
+          }
+          candidates.push({
+            sourcePath: document.relativePath,
+            sourceKind: document.kind,
+            sourceSection: section.heading,
+            excerpt: sentence,
+            value: sentence,
+          });
+        }
+      }
+
+      if (candidateKinds.includes('command')) {
+        for (const command of extractShellCommands(section.text ?? '')) {
+          candidates.push({
+            sourcePath: document.relativePath,
+            sourceKind: document.kind,
+            sourceSection: section.heading,
+            excerpt: command,
+            value: command,
+          });
+        }
+      }
+    }
+  }
+  return candidates;
+}
+
+function scoreEvidenceCandidate(target, candidate) {
+  const normalizedTarget = normalizeProblemCandidate(target).toLowerCase();
+  const normalizedCandidate = normalizeProblemCandidate(candidate).toLowerCase();
+  if (!normalizedTarget || !normalizedCandidate) {
+    return 0;
+  }
+  if (normalizedTarget === normalizedCandidate) {
+    return 1;
+  }
+  const targetTokens = new Set(tokenizeEvidenceText(normalizedTarget));
+  const candidateTokens = new Set(tokenizeEvidenceText(normalizedCandidate));
+  let overlap = 0;
+  for (const token of targetTokens) {
+    if (candidateTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+  const lexicalOverlap = targetTokens.size > 0 ? overlap / targetTokens.size : 0;
+  const substringBoost = normalizedTarget.includes(normalizedCandidate) || normalizedCandidate.includes(normalizedTarget)
+    ? 0.22
+    : 0;
+  return lexicalOverlap + substringBoost;
+}
+
+function resolveDocumentationSourcesForSignal(signal, surface) {
+  if (/cover surface|badge-led framing/i.test(signal)) {
+    return [createEvidenceSource({
+      sourcePath: surface.readmePath,
+      sourceKind: 'readme',
+      sourceSection: 'opening',
+      excerpt: 'Centered hero and badge row detected in README opening.',
+    })];
+  }
+  if (/anchor navigation/i.test(signal)) {
+    return [createEvidenceSource({
+      sourcePath: surface.readmePath,
+      sourceKind: 'readme',
+      sourceSection: 'opening',
+      excerpt: 'README opening exposes anchor navigation links.',
+    })];
+  }
+  if (/panel-like|product surface/i.test(signal)) {
+    return [createEvidenceSource({
+      sourcePath: surface.readmePath,
+      sourceKind: 'readme',
+      sourceSection: 'Product Surface',
+      excerpt: 'README uses table and image panels to preview the product surface.',
+    })];
+  }
+  if (/Mermaid/i.test(signal)) {
+    return [createEvidenceSource({
+      sourcePath: surface.architectureDocPath ?? surface.readmePath,
+      sourceKind: surface.architectureDocPath ? 'doc' : 'readme',
+      sourceSection: 'diagram',
+      excerpt: 'Documentation contains Mermaid diagrams for system topology or flow.',
+    })];
+  }
+  if (/split into focused docs/i.test(signal)) {
+    return [
+      createEvidenceSource({ sourcePath: surface.architectureDocPath, sourceKind: 'doc', sourceSection: 'Architecture', excerpt: 'Architecture guidance lives in a focused subdoc.' }),
+      createEvidenceSource({ sourcePath: surface.troubleshootingDocPath, sourceKind: 'doc', sourceSection: 'Troubleshooting', excerpt: 'Troubleshooting guidance lives in a focused subdoc.' }),
+    ].filter(Boolean);
+  }
+  if (/overview and data flow/i.test(signal)) {
+    return [createEvidenceSource({
+      sourcePath: surface.architectureDocPath,
+      sourceKind: 'doc',
+      sourceSection: 'Overview / Data Flow',
+      excerpt: 'Architecture doc leads with Overview and Data Flow sections.',
+    })].filter(Boolean);
+  }
+  if (/Symptoms|operator/i.test(signal)) {
+    return [createEvidenceSource({
+      sourcePath: surface.troubleshootingDocPath,
+      sourceKind: 'doc',
+      sourceSection: 'Symptoms / Checks',
+      excerpt: 'Troubleshooting doc uses Symptoms and Checks blocks.',
+    })].filter(Boolean);
+  }
+  if (/agent-facing guidance/i.test(signal)) {
+    return (surface.agentGuidancePaths ?? []).slice(0, 2).map((relativePath) => createEvidenceSource({
+      sourcePath: relativePath,
+      sourceKind: /copilot-instructions/i.test(relativePath) ? 'agent-guidance' : 'doc',
+      sourceSection: 'agent-guidance',
+      excerpt: 'Explicit agent instruction surface detected.',
+    }));
+  }
+  return [createEvidenceSource({
+    sourcePath: surface.readmePath ?? surface.architectureDocPath,
+    sourceKind: surface.readmePath ? 'readme' : 'doc',
+    sourceSection: 'documentation-surface',
+    excerpt: signal,
+  })].filter(Boolean);
+}
+
+function resolveDocumentationSourcesForPattern(pattern, surface) {
+  if (/README opening sequence pattern/i.test(pattern)) {
+    return [createEvidenceSource({
+      sourcePath: surface.readmePath,
+      sourceKind: 'readme',
+      sourceSection: 'opening',
+      excerpt: 'Centered hero, badges, and anchor navigation appear together in the README opening.',
+    })].filter(Boolean);
+  }
+  if (/GitHub showcase pattern/i.test(pattern)) {
+    return [createEvidenceSource({
+      sourcePath: surface.readmePath,
+      sourceKind: 'readme',
+      sourceSection: 'Product Surface',
+      excerpt: 'README previews the product surface with table/image showcase panels.',
+    })].filter(Boolean);
+  }
+  if (/Diagram placement pattern/i.test(pattern)) {
+    return [createEvidenceSource({
+      sourcePath: surface.architectureDocPath ?? surface.readmePath,
+      sourceKind: surface.architectureDocPath ? 'doc' : 'readme',
+      sourceSection: 'diagram',
+      excerpt: 'Mermaid is used at topology or flow transitions instead of as decoration.',
+    })].filter(Boolean);
+  }
+  if (/Documentation layout pattern/i.test(pattern)) {
+    return [
+      createEvidenceSource({ sourcePath: surface.readmePath, sourceKind: 'readme', sourceSection: 'opening', excerpt: 'README acts as the cover surface.' }),
+      createEvidenceSource({ sourcePath: surface.architectureDocPath, sourceKind: 'doc', sourceSection: 'Architecture', excerpt: 'Architecture detail moves into a focused subdoc.' }),
+      createEvidenceSource({ sourcePath: surface.troubleshootingDocPath, sourceKind: 'doc', sourceSection: 'Troubleshooting', excerpt: 'Troubleshooting detail moves into a focused subdoc.' }),
+    ].filter(Boolean);
+  }
+  if (/Architecture document pattern/i.test(pattern)) {
+    return [createEvidenceSource({
+      sourcePath: surface.architectureDocPath,
+      sourceKind: 'doc',
+      sourceSection: 'Overview / Data Flow',
+      excerpt: 'Architecture doc sequences Overview and Data Flow before deeper detail.',
+    })].filter(Boolean);
+  }
+  if (/Troubleshooting pattern/i.test(pattern)) {
+    return [createEvidenceSource({
+      sourcePath: surface.troubleshootingDocPath,
+      sourceKind: 'doc',
+      sourceSection: 'Symptoms / Checks',
+      excerpt: 'Troubleshooting doc is structured around symptoms, checks, and recovery.',
+    })].filter(Boolean);
+  }
+  if (/Agent guidance pattern/i.test(pattern)) {
+    return (surface.agentGuidancePaths ?? []).slice(0, 2).map((relativePath) => createEvidenceSource({
+      sourcePath: relativePath,
+      sourceKind: /copilot-instructions/i.test(relativePath) ? 'agent-guidance' : 'doc',
+      sourceSection: 'agent-guidance',
+      excerpt: 'Agent guidance files are boundary-led and explicit about forbidden regressions.',
+    }));
+  }
+  if (/README pacing pattern/i.test(pattern)) {
+    return [createEvidenceSource({
+      sourcePath: surface.readmePath,
+      sourceKind: 'readme',
+      sourceSection: 'README pacing',
+      excerpt: 'README headings show product story first, onboarding next, appendix last.',
+    })].filter(Boolean);
+  }
+  if (/Progressive disclosure pattern/i.test(pattern)) {
+    return [createEvidenceSource({
+      sourcePath: surface.readmePath,
+      sourceKind: 'readme',
+      sourceSection: 'details',
+      excerpt: 'README uses details blocks to hide secondary reference material.',
+    })].filter(Boolean);
+  }
+  return [createEvidenceSource({
+    sourcePath: surface.readmePath ?? surface.architectureDocPath,
+    sourceKind: surface.readmePath ? 'readme' : 'doc',
+    sourceSection: 'documentation-pattern',
+    excerpt: pattern,
+  })].filter(Boolean);
+}
+
+function findDocumentByName(documents, fileName) {
+  return documents.find((document) => path.basename(document.relativePath) === fileName) ?? null;
+}
+
+function findDirectorySource(directories, pattern, excerpt) {
+  const match = directories.find((directory) => pattern.test(directory));
+  if (!match) {
+    return null;
+  }
+  return createEvidenceSource({
+    sourcePath: match,
+    sourceKind: 'directory',
+    sourceSection: 'top-level',
+    excerpt,
+  });
+}
+
+function findFileSource(files, fileName, excerpt) {
+  const match = files.find((file) => path.basename(file.relativePath) === fileName);
+  if (!match) {
+    return null;
+  }
+  return createEvidenceSource({
+    sourcePath: match.relativePath,
+    sourceKind: 'manifest',
+    sourceSection: 'entrypoint',
+    excerpt,
+  });
+}
+
+function tokenizeEvidenceText(value) {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_\-\s]+/g, ' ')
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+}
+
+function extractShellCommands(text) {
+  const commands = [];
+  for (const match of String(text ?? '').matchAll(/```(?:bash|sh|shell|zsh|console)?\n([\s\S]*?)```/g)) {
+    const block = match[1] ?? '';
+    for (const rawLine of block.split('\n')) {
+      const line = rawLine.replace(/^\$\s*/, '').trim();
+      if (!line || !isShellCommandCandidate(line)) {
+        continue;
+      }
+      commands.push(line);
+    }
+  }
+  return uniqueStrings(commands);
 }
 
 function detectEntryPoints(files) {
@@ -1101,6 +1991,40 @@ function extractMarkdownHeadings(text) {
     .slice(0, 12);
 }
 
+function extractDocumentSections(text) {
+  const sections = [];
+  let currentHeading = null;
+  let currentLines = [];
+
+  const flush = () => {
+    const sectionText = currentLines.join('\n').trim();
+    if (!currentHeading && !sectionText) {
+      return;
+    }
+    sections.push({
+      heading: currentHeading,
+      text: sectionText,
+    });
+  };
+
+  for (const rawLine of String(text ?? '').split('\n')) {
+    const headingMatch = rawLine.match(/^#{1,6}\s+(.+)$/);
+    if (headingMatch) {
+      flush();
+      currentHeading = cleanInlineMarkdown(headingMatch[1]?.trim() ?? '');
+      currentLines = [];
+      continue;
+    }
+    currentLines.push(rawLine);
+  }
+
+  flush();
+  if (sections.length === 0) {
+    return [{ heading: null, text: String(text ?? '').trim() }];
+  }
+  return sections.filter((section) => section.heading || section.text);
+}
+
 function extractBulletStatements(text) {
   return markdownToText(text)
     .split('\n')
@@ -1122,6 +2046,49 @@ function extractDescriptiveSentences(text) {
 
 function normalizeProblemCandidate(value) {
   return cleanInlineMarkdown(String(value ?? '').replace(/\s+/g, ' ').trim());
+}
+
+function ensureTrailingPeriod(value) {
+  const normalized = normalizeProblemCandidate(value);
+  if (!normalized) {
+    return '';
+  }
+  return /[.!?]$/.test(normalized) ? normalized : `${normalized}.`;
+}
+
+function isHighSignalProblemCandidate(candidate) {
+  return BOUNDARY_SIGNAL_PATTERN.test(candidate) || /under [.~\/_A-Za-z0-9-]+|instead of|without /i.test(candidate);
+}
+
+function isHighSignalBoundaryCandidate(candidate) {
+  return candidate.length >= 24 && candidate.length <= 180 && BOUNDARY_SIGNAL_PATTERN.test(candidate);
+}
+
+function isHighSignalPatternCandidate(candidate) {
+  if (!candidate || candidate.length < 32 || candidate.length > 180) {
+    return false;
+  }
+  if (!BOUNDARY_SIGNAL_PATTERN.test(candidate)) {
+    return false;
+  }
+  return /^(keep|use|store|split|treat|extend|limit|surface|encode|preserve|avoid|prefer)\b/i.test(candidate) || / instead of /i.test(candidate);
+}
+
+function isShellCommandCandidate(candidate) {
+  if (!/^(npm|pnpm|yarn|bun|node|python|pytest|go\s+test|cargo\s+test|dotnet|mvn|gradle|flutter)\b/i.test(candidate)) {
+    return false;
+  }
+  return VALIDATION_SIGNAL_PATTERN.test(candidate);
+}
+
+function isUsefulValidationSurface(candidate) {
+  if (!candidate) {
+    return false;
+  }
+  if (candidate.length < 12 || candidate.length > 220) {
+    return false;
+  }
+  return VALIDATION_SIGNAL_PATTERN.test(candidate);
 }
 
 function isUsefulProblemCandidate(candidate, projectName) {
@@ -1146,6 +2113,9 @@ function isUsefulProblemCandidate(candidate, projectName) {
     return false;
   }
   if (/locally indexed software project tracked inside the ai brain vault/i.test(normalized)) {
+    return false;
+  }
+  if (/^happy path\b|^what it does\b|^what it does not do\b/i.test(normalized)) {
     return false;
   }
   return true;

@@ -3,6 +3,12 @@ import path from 'node:path';
 
 import { LocalSemanticEmbedder } from '../embeddings/index.mjs';
 import { readProjectNoteContents, writeQueryHistoryNote as writeCanonicalQueryHistoryNote } from '../obsidian-writer/index.mjs';
+import {
+  maxEvidenceConfidence,
+  maxEvidenceQuality,
+  pickTopEvidenceItems,
+  summarizeEvidenceSource,
+} from '../provenance/index.mjs';
 import { reasonAboutQuery } from '../reasoner/index.mjs';
 import { buildResearchConsultation, synthesizeLocalAndExternalGuidance } from '../research/index.mjs';
 import { expandQueryText, retrieveContext } from '../retriever/index.mjs';
@@ -94,8 +100,18 @@ export async function searchBrain({ query, currentProjectPath, currentProjectNam
       project: result.project,
       noteType: result.noteType,
       sourcePath: result.sourcePath,
+      sourceKind: result.sourceKind,
       relevanceScore: result.relevanceScore,
       whyMatched: result.whyMatched,
+      whyTrusted: result.whyTrusted,
+      knowledgeType: result.knowledgeType,
+      knowledgeStrength: result.knowledgeStrength,
+      evidenceQuality: result.evidenceQuality,
+      confidence: result.confidence,
+      supportCount: result.supportCount,
+      supportingSources: result.supportingSources ?? [],
+      derivedFrom: result.derivedFrom ?? [],
+      evidenceSummary: result.evidenceSummary ?? '',
       snippet: result.snippet,
       matchedTerms: result.matchedTerms ?? [],
     })),
@@ -275,6 +291,8 @@ export async function captureLearning({
   tags = [],
   runtimeOptions,
 } = {}) {
+  validateCapturedLearningInput({ title, problem, context, solution, whyItWorked, reusablePattern });
+
   const runtime = await loadBrainRuntime(runtimeOptions);
   let readyRuntime = await ensureKnowledgeReady(runtime, { skipEmbed: true });
   let workerModule = null;
@@ -347,6 +365,8 @@ export async function captureResearchCandidate({
   tags = [],
   runtimeOptions,
 } = {}) {
+  validateResearchCandidateInput({ title, query, finding, recommendation, whyItMatters, reusePotential, sourceQuality });
+
   const runtime = await loadBrainRuntime(runtimeOptions);
   const notePath = path.join(runtime.config.vaultRoot, '03_Agent_Notes', 'research-candidates.md');
   await ensureDir(path.dirname(notePath));
@@ -462,7 +482,9 @@ async function getRelatedPatternsInternal(runtime, { query, currentProjectName, 
     const currentProjectBoost = currentProjectName && pattern.sourceProjects.includes(currentProjectName) ? 0.15 : 0;
     const repeatedUseBoost = Math.min(pattern.sourceProjects.length * 0.04, 0.16);
     const documentationBoost = documentationQuery && isDocumentationPattern(pattern.pattern) ? 0.14 : 0;
-    const relevanceScore = Number(Math.min(1, lexicalScore + currentProjectBoost + repeatedUseBoost + documentationBoost).toFixed(4));
+    const evidenceBoost = pattern.evidenceQuality === 'strong' ? 0.12 : (pattern.evidenceQuality === 'medium' ? 0.06 : 0);
+    const confidenceBoost = Math.min(Number(pattern.confidence ?? 0) * 0.08, 0.08);
+    const relevanceScore = Number(Math.min(1, lexicalScore + currentProjectBoost + repeatedUseBoost + documentationBoost + evidenceBoost + confidenceBoost).toFixed(4));
     return {
       patternTitle: pattern.pattern,
       explanation: pattern.explanation,
@@ -470,6 +492,11 @@ async function getRelatedPatternsInternal(runtime, { query, currentProjectName, 
       whereUsedBefore: pattern.whereUsedBefore.length > 0
         ? pattern.whereUsedBefore
         : pattern.sourceProjects.map((projectName) => buildProjectNoteReferences(runtime.config, projectName).learnings),
+      supportingEvidence: pattern.supportingEvidence.slice(0, 4),
+      evidenceQuality: pattern.evidenceQuality,
+      confidence: pattern.confidence,
+      supportCount: pattern.supportCount,
+      whyTrusted: buildPatternTrustSummary(pattern),
       relevanceScore,
     };
   });
@@ -499,12 +526,20 @@ async function getRecentLearningsInternal(runtime, { currentProjectName, categor
 
     for (const project of prioritized.slice(0, limit)) {
       const learningsPath = buildProjectNoteReferences(runtime.config, project.name).learnings;
+      const learningsText = await readText(learningsPath, '');
+      const summary = summarizeLearningNote(learningsText, project);
+      if (!summary.strong) {
+        continue;
+      }
       items.push({
         type: 'project-learning',
         projectName: project.name,
-        title: `${project.name}: ${project.recurringProblems?.[0] ?? project.purpose}`,
-        excerpt: project.reusableSolutions?.[0] ?? project.summary,
+        title: `${project.name}: ${summary.problem}`,
+        excerpt: summary.reusablePattern[0] ?? summary.solution[0] ?? summary.problem,
         notePath: learningsPath,
+        evidenceQuality: summary.evidenceQuality ?? 'weak',
+        confidence: summary.confidence ?? 0,
+        supportingSources: summary.supportingSources ?? [],
         updatedAt: runtime.state.projects?.[project.name]?.lastSyncedAt ?? null,
       });
     }
@@ -526,6 +561,14 @@ async function getRecentLearningsInternal(runtime, { currentProjectName, categor
         title: 'Debugging insight',
         excerpt: bullet,
         notePath: debuggingInsightsPath,
+        evidenceQuality: 'medium',
+        confidence: 0.64,
+        supportingSources: [{
+          sourcePath: debuggingInsightsPath,
+          sourceKind: 'note',
+          sourceSection: 'debugging-insights',
+          excerpt: bullet,
+        }],
         updatedAt: await safeFileTimestamp(debuggingInsightsPath),
       });
     }
@@ -545,6 +588,9 @@ async function getRecentLearningsInternal(runtime, { currentProjectName, categor
         title: pattern.patternTitle,
         excerpt: pattern.explanation,
         notePath: path.join(runtime.config.vaultRoot, '04_Knowledge_Base', documentationPattern ? 'documentation-style-patterns.md' : 'reusable-patterns.md'),
+        evidenceQuality: pattern.evidenceQuality ?? 'weak',
+        confidence: pattern.confidence ?? 0,
+        supportingSources: pattern.supportingEvidence ?? [],
         updatedAt: await safeFileTimestamp(path.join(runtime.config.vaultRoot, '04_Knowledge_Base', documentationPattern ? 'documentation-style-patterns.md' : 'reusable-patterns.md')),
       });
     }
@@ -561,6 +607,14 @@ async function getRecentLearningsInternal(runtime, { currentProjectName, categor
         title: entry.title,
         excerpt: entry.finding,
         notePath: candidatesPath,
+        evidenceQuality: 'medium',
+        confidence: 0.58,
+        supportingSources: [{
+          sourcePath: candidatesPath,
+          sourceKind: 'note',
+          sourceSection: entry.title,
+          excerpt: entry.finding,
+        }],
         updatedAt: await safeFileTimestamp(candidatesPath),
       });
     }
@@ -618,26 +672,64 @@ async function gatherLocalBrainContext({
 function buildPatternCatalog(projects) {
   const catalog = new Map();
   for (const project of projects) {
-    for (const pattern of project.reusableSolutions ?? []) {
+    const reusablePatternRecords = (project.provenance?.reusableSolutions ?? []).length > 0
+      ? project.provenance.reusableSolutions
+      : (project.reusableSolutions ?? []).map((value) => ({ value, sources: [], evidenceQuality: 'weak', confidence: 0.48 }));
+    for (const patternRecord of reusablePatternRecords) {
+      const pattern = patternRecord?.value ?? '';
+      if (!isHighSignalPattern(pattern)) {
+        continue;
+      }
       const entry = catalog.get(pattern) ?? {
         pattern,
         explanation: `Reuse this when a project needs the same shape as: ${pattern}`,
         sourceProjects: [],
         whereUsedBefore: [],
+        supportingEvidence: [],
+        evidenceQuality: patternRecord?.evidenceQuality ?? 'weak',
+        confidence: Number(patternRecord?.confidence ?? 0),
+        supportCount: 0,
       };
       entry.sourceProjects = uniqueStrings([...entry.sourceProjects, project.name]);
+      entry.supportingEvidence = mergeSupportingEvidence(entry.supportingEvidence, patternRecord?.sources ?? []);
+      entry.evidenceQuality = strongerEvidenceQuality(entry.evidenceQuality, patternRecord?.evidenceQuality ?? 'weak');
+      entry.confidence = Number(Math.max(entry.confidence, Number(patternRecord?.confidence ?? 0)).toFixed(4));
+      entry.supportCount = entry.supportingEvidence.length;
+      entry.whereUsedBefore = uniqueStrings([
+        ...entry.whereUsedBefore,
+        ...entry.supportingEvidence.map((source) => source.sourcePath),
+      ]);
       catalog.set(pattern, entry);
     }
 
-    for (const pattern of project.documentationPatterns ?? []) {
+    const documentationPatternRecords = (project.provenance?.documentationPatterns ?? []).length > 0
+      ? project.provenance.documentationPatterns
+      : (project.documentationPatterns ?? []).map((value) => ({ value, sources: [], evidenceQuality: 'weak', confidence: 0.48 }));
+    for (const patternRecord of documentationPatternRecords) {
+      const pattern = patternRecord?.value ?? '';
+      if (!isHighSignalPattern(pattern)) {
+        continue;
+      }
       const entry = catalog.get(pattern) ?? {
         pattern,
         explanation: `Documentation-style pattern grounded in repo-facing README and docs structure: ${pattern}`,
         sourceProjects: [],
         whereUsedBefore: [],
+        supportingEvidence: [],
+        evidenceQuality: patternRecord?.evidenceQuality ?? 'weak',
+        confidence: Number(patternRecord?.confidence ?? 0),
+        supportCount: 0,
       };
       entry.sourceProjects = uniqueStrings([...entry.sourceProjects, project.name]);
-      entry.whereUsedBefore = uniqueStrings([...entry.whereUsedBefore, ...buildDocumentationEvidencePaths(project)]);
+      entry.supportingEvidence = mergeSupportingEvidence(entry.supportingEvidence, patternRecord?.sources ?? []);
+      entry.evidenceQuality = strongerEvidenceQuality(entry.evidenceQuality, patternRecord?.evidenceQuality ?? 'weak');
+      entry.confidence = Number(Math.max(entry.confidence, Number(patternRecord?.confidence ?? 0)).toFixed(4));
+      entry.supportCount = entry.supportingEvidence.length;
+      entry.whereUsedBefore = uniqueStrings([
+        ...entry.whereUsedBefore,
+        ...entry.supportingEvidence.map((source) => source.sourcePath),
+        ...buildDocumentationEvidencePaths(project),
+      ]);
       catalog.set(pattern, entry);
     }
   }
@@ -651,10 +743,17 @@ function buildDocumentationEvidencePaths(project) {
 }
 
 function isDocumentationPattern(patternTitle) {
-  return /README opening sequence pattern|GitHub showcase pattern|Diagram placement pattern|Documentation layout pattern|Architecture document pattern|Troubleshooting pattern|Agent guidance pattern|README pacing pattern|Progressive disclosure pattern/i.test(String(patternTitle ?? ''));
+  return /readme|github showcase|diagram|documentation layout|architecture document|operator guide|troubleshooting|agent guidance|instructions|progressive disclosure|repo presentation/i.test(String(patternTitle ?? ''));
 }
 
 function summarizeLearningNote(noteText, project) {
+  const entries = parseLearningEntries(noteText);
+  for (const entry of entries) {
+    if (entry.strong) {
+      return entry;
+    }
+  }
+
   const sections = parseMarkdownSections(noteText);
   const solution = extractBulletLines(sections.Solution ?? '').slice(0, 3);
   const whyItWorked = extractBulletLines(sections['Why It Worked'] ?? '').slice(0, 3);
@@ -664,15 +763,23 @@ function summarizeLearningNote(noteText, project) {
   const structuredWhyItWorked = extractMeaningfulLines(extractBoldField(noteText, 'Why it worked')).slice(0, 3);
   const structuredReusablePattern = extractMeaningfulLines(extractBoldField(noteText, 'Reusable Pattern')).slice(0, 2);
   const structuredFollowUp = extractMeaningfulLines(extractBoldField(noteText, 'Follow-up')).slice(0, 3);
-
-  return {
-    problem: firstNonEmptyLine(sections.Problem ?? '') ?? firstNonEmptyLine(structuredProblem) ?? project.recurringProblems?.[0] ?? project.purpose,
-    solution: solution.length > 0 ? solution : (structuredSolution.length > 0 ? structuredSolution : (project.reusableSolutions ?? []).slice(0, 3)),
-    whyItWorked: whyItWorked.length > 0 ? whyItWorked : (structuredWhyItWorked.length > 0 ? structuredWhyItWorked : (project.architecture ?? []).slice(0, 3)),
+  const fallbackEvidence = buildLearningFallbackEvidence(project);
+  const fallback = {
+    problem: firstNonEmptyLine(sections.Problem ?? '') ?? firstNonEmptyLine(structuredProblem) ?? project.boundaryRules?.[0] ?? project.recurringProblems?.[0] ?? project.purpose,
+    solution: solution.length > 0 ? solution : (structuredSolution.length > 0 ? structuredSolution : (project.validationSurfaces ?? project.reusableSolutions ?? []).slice(0, 3)),
+    whyItWorked: whyItWorked.length > 0 ? whyItWorked : (structuredWhyItWorked.length > 0 ? structuredWhyItWorked : (project.boundaryRules ?? project.architecture ?? []).slice(0, 3)),
     reusablePattern: reusablePattern.length > 0 ? reusablePattern : (structuredReusablePattern.length > 0 ? structuredReusablePattern : (project.reusableSolutions ?? []).slice(0, 2)),
     followUp: extractBulletLines(sections['Follow-Up'] ?? '').slice(0, 3).length > 0
       ? extractBulletLines(sections['Follow-Up'] ?? '').slice(0, 3)
       : structuredFollowUp,
+    evidenceQuality: fallbackEvidence.evidenceQuality,
+    confidence: fallbackEvidence.confidence,
+    supportingSources: fallbackEvidence.supportingSources,
+  };
+
+  return {
+    ...fallback,
+    strong: isStrongLearningSummary(fallback),
   };
 }
 
@@ -686,11 +793,20 @@ async function buildProjectSummaryPayload(runtime, project) {
     purpose: project.purpose,
     stack: project.stack.slice(0, 10),
     architecture: project.architecture.slice(0, 8),
+    boundaries: (project.boundaryRules ?? []).slice(0, 6),
+    validationSurfaces: (project.validationSurfaces ?? []).slice(0, 6),
     importantFiles: uniqueStrings([...(project.entryPoints ?? []), ...(project.documentationPaths ?? [])]).slice(0, 10),
     importantModules: (project.modules ?? []).slice(0, 10),
     relevantLearnings: learnings,
     projectPatterns: (project.reusableSolutions ?? []).slice(0, 6),
     documentationPatterns: (project.documentationPatterns ?? []).slice(0, 6),
+    provenance: {
+      purpose: project.provenance?.purpose ?? null,
+      boundaries: pickTopEvidenceItems(project.provenance?.boundaryRules ?? [], 4),
+      validationSurfaces: pickTopEvidenceItems(project.provenance?.validationSurfaces ?? [], 4),
+      reusableSolutions: pickTopEvidenceItems(project.provenance?.reusableSolutions ?? [], 4),
+      documentationPatterns: pickTopEvidenceItems(project.provenance?.documentationPatterns ?? [], 4),
+    },
     noteReferences: buildProjectNoteReferences(runtime.config, project.name),
     lastSyncedAt: runtime.state.projects?.[project.name]?.lastSyncedAt ?? null,
   };
@@ -846,6 +962,48 @@ function buildResearchNoteTargets(config, projectName) {
   };
 }
 
+function parseLearningEntries(text) {
+  const sections = String(text ?? '').split(/^##\s+/m).slice(1);
+  return sections.map((rawSection) => {
+    const lines = rawSection.split('\n');
+    const heading = lines.shift()?.trim() ?? '';
+    if (!heading || /capture rule/i.test(heading)) {
+      return null;
+    }
+    const body = lines.join('\n').trim();
+    if (!body) {
+      return null;
+    }
+    const problem = extractMeaningfulLines(extractBoldField(body, 'Problem'));
+    const solution = extractMeaningfulLines(extractBoldField(body, 'Solution'));
+    const whyItWorked = extractMeaningfulLines(extractBoldField(body, 'Why it worked')).length > 0
+      ? extractMeaningfulLines(extractBoldField(body, 'Why it worked'))
+      : extractMeaningfulLines(extractBoldField(body, 'Why It Worked'));
+    const reusablePattern = extractMeaningfulLines(extractBoldField(body, 'Reusable Pattern'));
+    const followUp = extractMeaningfulLines(extractBoldField(body, 'Follow-up')).length > 0
+      ? extractMeaningfulLines(extractBoldField(body, 'Follow-up'))
+      : extractMeaningfulLines(extractBoldField(body, 'Follow-Up'));
+    const supportingSources = extractMeaningfulLines(extractBoldField(body, 'Evidence')).map(parseSupportingSourceLine).filter(Boolean);
+    const confidenceText = extractBoldField(body, 'Confidence');
+    const entry = {
+      title: heading,
+      problem: problem[0] ?? '',
+      solution: solution.slice(0, 3),
+      whyItWorked: whyItWorked.slice(0, 3),
+      reusablePattern: reusablePattern.slice(0, 2),
+      followUp: followUp.slice(0, 3),
+      evidenceQuality: inferEvidenceQualityFromConfidenceText(confidenceText, supportingSources),
+      confidence: inferConfidenceFromText(confidenceText, supportingSources),
+      supportingSources,
+    };
+
+    return {
+      ...entry,
+      strong: isStrongLearningSummary(entry),
+    };
+  }).filter(Boolean);
+}
+
 function parseMarkdownSections(text) {
   const generatedText = extractGeneratedBlock(text);
   const sections = {};
@@ -863,6 +1021,145 @@ function parseMarkdownSections(text) {
     }
   }
   return Object.fromEntries(Object.entries(sections).map(([key, value]) => [key, value.join('\n').trim()]));
+}
+
+function isStrongLearningSummary(summary) {
+  const problem = String(summary?.problem ?? '').trim();
+  const solution = summary?.solution ?? [];
+  const reusablePattern = summary?.reusablePattern ?? [];
+  if (!problem || problem.length < 24) {
+    return false;
+  }
+  if (solution.length === 0 && reusablePattern.length === 0) {
+    return false;
+  }
+  return !/does not yet have enough evidence|capture rule|locally indexed software project/i.test(problem.toLowerCase());
+}
+
+function isHighSignalPattern(pattern) {
+  const normalized = String(pattern ?? '').trim().toLowerCase();
+  if (!normalized || normalized.length < 24) {
+    return false;
+  }
+  return !/capture repeatable implementation decisions in dedicated notes/i.test(normalized);
+}
+
+function buildLearningFallbackEvidence(project) {
+  const evidenceItems = pickTopEvidenceItems([
+    ...(project.provenance?.boundaryRules ?? []),
+    ...(project.provenance?.validationSurfaces ?? []),
+    ...(project.provenance?.reusableSolutions ?? []),
+  ], 3);
+  return {
+    evidenceQuality: maxEvidenceQuality(evidenceItems),
+    confidence: Number(maxEvidenceConfidence(evidenceItems).toFixed(4)),
+    supportingSources: mergeSupportingEvidence([], evidenceItems.flatMap((item) => item.sources ?? [])),
+  };
+}
+
+function mergeSupportingEvidence(existingSources, newSources) {
+  const keyed = new Map();
+  for (const source of [...(existingSources ?? []), ...(newSources ?? [])].filter(Boolean)) {
+    const key = `${source.sourcePath}:${source.sourceSection ?? ''}:${source.excerpt ?? ''}`;
+    if (!keyed.has(key)) {
+      keyed.set(key, {
+        sourcePath: source.sourcePath,
+        sourceKind: source.sourceKind,
+        sourceSection: source.sourceSection ?? null,
+        excerpt: source.excerpt ?? '',
+      });
+    }
+  }
+  return [...keyed.values()].slice(0, 6);
+}
+
+function strongerEvidenceQuality(left, right) {
+  const rank = { weak: 1, medium: 2, strong: 3 };
+  return (rank[right] ?? 0) > (rank[left] ?? 0) ? right : left;
+}
+
+function buildPatternTrustSummary(pattern) {
+  const reasons = [`evidence quality: ${pattern.evidenceQuality}`];
+  reasons.push(`confidence: ${Number(pattern.confidence ?? 0).toFixed(2)}`);
+  if ((pattern.supportCount ?? 0) > 0) {
+    reasons.push(`support traces: ${pattern.supportCount}`);
+  }
+  if ((pattern.supportingEvidence ?? []).length > 0) {
+    reasons.push(`nearest evidence: ${summarizeEvidenceSource(pattern.supportingEvidence[0])}`);
+  }
+  return reasons.join('; ');
+}
+
+function inferEvidenceQualityFromConfidenceText(confidenceText, supportingSources) {
+  const normalized = String(confidenceText ?? '').toLowerCase();
+  if (normalized.includes('strong')) {
+    return 'strong';
+  }
+  if (normalized.includes('medium')) {
+    return 'medium';
+  }
+  if (supportingSources.length >= 2) {
+    return 'strong';
+  }
+  if (supportingSources.length === 1) {
+    return 'medium';
+  }
+  return 'weak';
+}
+
+function inferConfidenceFromText(confidenceText, supportingSources) {
+  const normalized = String(confidenceText ?? '').toLowerCase();
+  const numeric = Number(normalized.match(/\d+(?:\.\d+)?/)?.[0] ?? NaN);
+  if (!Number.isNaN(numeric)) {
+    return numeric > 1 ? Number((numeric / 100).toFixed(4)) : Number(numeric.toFixed(4));
+  }
+  if (normalized.includes('strong')) {
+    return 0.86;
+  }
+  if (normalized.includes('medium')) {
+    return 0.7;
+  }
+  if (supportingSources.length >= 2) {
+    return 0.82;
+  }
+  if (supportingSources.length === 1) {
+    return 0.68;
+  }
+  return 0.48;
+}
+
+function parseSupportingSourceLine(line) {
+  const normalized = String(line ?? '').replace(/^[-*]\s+/, '').trim();
+  if (!normalized) {
+    return null;
+  }
+  const [left, excerptPart] = normalized.split('::');
+  const segments = left.split('>').map((segment) => segment.trim()).filter(Boolean);
+  const sourcePath = segments.shift() ?? normalized;
+  const sourceSection = segments.length > 0 ? segments.join(' > ') : null;
+  return {
+    sourcePath,
+    sourceKind: inferSourceKindFromPath(sourcePath),
+    sourceSection,
+    excerpt: (excerptPart ?? '').trim(),
+  };
+}
+
+function inferSourceKindFromPath(sourcePath) {
+  const normalized = String(sourcePath ?? '').toLowerCase();
+  if (/readme/.test(normalized)) {
+    return 'readme';
+  }
+  if (/agents|claude|copilot-instructions/.test(normalized)) {
+    return 'agent-guidance';
+  }
+  if (/package\.json|pyproject|cargo\.toml|go\.mod|pom\.xml|gradle|pubspec\.yaml/.test(normalized)) {
+    return 'manifest';
+  }
+  if (/\.md$|\.mdx$|\.rst$|\.txt$/.test(normalized)) {
+    return 'doc';
+  }
+  return 'note';
 }
 
 function extractGeneratedBlock(text) {
@@ -946,6 +1243,50 @@ function extractMeaningfulLines(text) {
     .map((line) => line.trim())
     .map((line) => line.replace(/^[-*]\s+/, '').trim())
     .filter(Boolean);
+}
+
+function normalizeCaptureField(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function validateCapturedLearningInput({ title, problem, context, solution, whyItWorked, reusablePattern }) {
+  const fields = {
+    title: normalizeCaptureField(title),
+    problem: normalizeCaptureField(problem),
+    context: normalizeCaptureField(context),
+    solution: normalizeCaptureField(solution),
+    whyItWorked: normalizeCaptureField(whyItWorked),
+    reusablePattern: normalizeCaptureField(reusablePattern),
+  };
+  const errors = Object.entries(fields)
+    .filter(([, value]) => !isHighSignalCaptureField(value))
+    .map(([key]) => key);
+
+  if (!containsTechnicalAnchor(Object.values(fields).join(' '))) {
+    errors.push('technical-anchor');
+  }
+
+  if (errors.length > 0) {
+    throw new Error(`Learning rejected because it is too generic or weak: ${errors.join(', ')}`);
+  }
+}
+
+function validateResearchCandidateInput({ title, query, finding, recommendation, whyItMatters, reusePotential, sourceQuality }) {
+  const fields = [title, query, finding, recommendation, whyItMatters, reusePotential, sourceQuality].map((value) => normalizeCaptureField(value));
+  if (fields.some((value) => !isHighSignalCaptureField(value, { minLength: 18 }))) {
+    throw new Error('Research candidate rejected because the finding is too generic or incomplete.');
+  }
+}
+
+function isHighSignalCaptureField(value, { minLength = 24 } = {}) {
+  if (!value || value.length < minLength) {
+    return false;
+  }
+  return !/best practice|good pattern|improve code quality|follow existing pattern|general guidance|use best practices/i.test(value.toLowerCase());
+}
+
+function containsTechnicalAnchor(value) {
+  return /(npm run|pytest|go test|cargo test|dotnet test|mvn |gradle |\/|\.[a-z]{2,4}\b|token|auth|retry|deploy|schema|migration|operator|runtime|vault|state|cache|module|cli|mcp|docs|prompt|pattern)/i.test(value);
 }
 
 function escapeRegExp(value) {

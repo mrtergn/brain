@@ -60,6 +60,7 @@ Learn reusable README, architecture-doc, troubleshooting, and agent-instruction 
 | --- | --- |
 | Repo context decays into stale notes | Rewrite a narrow canonical note set instead of accumulating ad hoc summaries |
 | Agents answer with generic web advice | Start from local retrieval, related patterns, and recent learnings before escalating |
+| Agents cannot explain why a learning is trustworthy | Preserve evidence traces, confidence, and support counts from analysis through retrieval and consultation |
 | External research pollutes long-term memory | Keep provisional findings in `research-candidates.md` until they are proven |
 | Vault structure drifts over time | Fail fast with `brain:validate:vault` and `brain:doctor` |
 | Documentation work starts from generic markdown | Reuse documentation-style patterns derived from strong local repositories |
@@ -131,6 +132,16 @@ During analysis, Brain can derive documentation-style patterns from real repo ev
 
 That is what lets future README and docs work start from strong local precedent instead of generic markdown templates.
 
+## Inspectable Trust
+
+Brain now treats durable memory as something it must justify, not just retrieve.
+
+- Analysis extracts provenance-backed boundary rules, validation surfaces, reusable solutions, and documentation patterns from real repo evidence.
+- Normalization and chunking preserve `provenance-v1`, confidence, evidence quality, support count, and supporting source traces instead of flattening everything into plain strings.
+- `brain:query` now explains both why a result matched and why it is trustworthy.
+- `brain:consult` now returns a trust summary, local evidence basis, and clearer reasons when external guidance is still required.
+- The canonical writer surfaces provenance selectively through confidence and evidence lines in learnings and documentation-style patterns without dumping raw metadata into the vault.
+
 ## Consultation Flow
 
 ```mermaid
@@ -172,6 +183,7 @@ What each stage does:
 - `brain:sync` refreshes canonical project notes and managed global notes, including cross-project documentation-style patterns.
 - `brain:validate:vault` fails if legacy markers, project logs, knowledge mirrors, or runtime artifacts reappear in the vault.
 - `brain:doctor` checks vault integrity, retrieval readiness, consultation behavior, and MCP health.
+- `brain:doctor`, `brain:query`, and `brain:consult` now also verify that the runtime can expose trust-aware evidence fields instead of returning opaque matches.
 - `brain:embed` rebuilds the local semantic index.
 - `brain:consult` is the primary guidance entrypoint.
 - `brain:query` is the lower-level retrieval debugger.

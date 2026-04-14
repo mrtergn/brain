@@ -30,9 +30,20 @@ The canonical source entrypoint is `apps/mcp-server/index.mjs`. The generated sh
 
 ## Documentation-Aware Context
 
-For repo-facing documentation tasks, the MCP surface can now expose more than plain project summaries. `brain.project_summary` may include `documentationPatterns`, and consult-style local context can include `noteReferences.documentationStyle` so agents can trace documentation guidance back to the managed knowledge note.
+For repo-facing documentation tasks, the MCP surface can now expose more than plain project summaries. `brain.project_summary` may include `documentationPatterns`, `boundaries`, and `validationSurfaces`, and consult-style local context can include `noteReferences.documentationStyle` so agents can trace documentation guidance back to the managed knowledge note.
 
-That means README, architecture-doc, operator-doc, and agent-instruction work can start from local benchmark patterns instead of generic markdown generation.
+That means README, architecture-doc, operator-doc, and agent-instruction work can start from local benchmark patterns instead of generic markdown generation, while implementation work can start from real project boundaries and the nearest validation surface rather than broad stack summaries.
+
+## Provenance-Aware Responses
+
+The MCP payloads are now explicitly trust-aware.
+
+- `brain.search` results include `whyTrusted`, `sourceKind`, `knowledgeType`, `knowledgeStrength`, `evidenceQuality`, `confidence`, `supportCount`, `supportingSources`, `derivedFrom`, and `evidenceSummary`.
+- `brain.consult` includes `trustSummary`, `localContext.evidenceBasis`, and evidence-rich `topResults`, `relatedPatterns`, and `recentLearnings`.
+- `brain.project_summary` includes provenance-backed `boundaries`, `validationSurfaces`, and a top-level `provenance` object with the strongest evidence records.
+- `brain.related_patterns` and `brain.recent_learnings` now expose trust fields so agents can prefer stronger reusable memory instead of assuming every pattern is equally reliable.
+
+These fields are additive and compatible with existing clients. Agents that do not need them can ignore them, but agents doing non-trivial work should use them to decide whether local memory is strong enough to lead.
 
 ## Recommended Registration Targets
 
@@ -116,6 +127,7 @@ When user-level instructions and MCP registration are in place, Copilot should f
 4. Call `brain.synthesize_guidance` before adapting external guidance to the current repo.
 5. Capture only proven learnings or explicit research candidates.
 6. For README, docs, and agent-guidance tasks, prefer local documentation patterns and benchmark repo surfaces before inventing a new structure.
+7. Prefer results with stronger evidence quality and clearer supporting traces when multiple local answers are available.
 
 The write-back discipline is strict:
 

@@ -19,6 +19,12 @@ import {
   uniqueStrings,
   writeText,
 } from '../shared/index.mjs';
+import {
+  maxEvidenceConfidence,
+  maxEvidenceQuality,
+  pickTopEvidenceItems,
+  summarizeEvidenceSource,
+} from '../provenance/index.mjs';
 
 const STATIC_FOLDER_READMES = {
   '00_Inbox/README.md': [
@@ -194,6 +200,10 @@ async function ensureCanonicalStaticNote(filePath, content, { preserveExisting =
     if (preserveExisting && !shouldRewriteCanonicalNote(existing)) {
       return;
     }
+    if (preserveExisting) {
+      await writeText(filePath, preserveCanonicalStaticContent(existing, content));
+      return;
+    }
   }
   await writeText(filePath, content);
 }
@@ -206,7 +216,7 @@ async function ensureOptionalCanonicalStaticNote(filePath, content) {
   if (!shouldRewriteCanonicalNote(existing)) {
     return;
   }
-  await writeText(filePath, content);
+  await writeText(filePath, preserveCanonicalStaticContent(existing, content));
 }
 
 async function ensureCanonicalSummaryNote(filePath, content) {
@@ -261,6 +271,9 @@ function renderArchitectureNote(project) {
     '## Important Interfaces',
     renderBulletList(buildImportantInterfaces(project), 'No strong interface surface was inferred beyond the main repository structure.'),
     '',
+    '## Validation Surfaces',
+    renderBulletList(buildValidationSurfaces(project), 'No explicit validation surface was inferred; inspect tests, scripts, or operator docs before broad changes.'),
+    '',
     '## Architectural Constraints',
     renderBulletList(buildArchitecturalConstraints(project), 'There are no strong inferred constraints yet; verify assumptions from docs, tests, and scripts.'),
     '',
@@ -302,6 +315,12 @@ function renderLearningsNote(project) {
     sections.push('**Reusable Pattern**');
     sections.push(learning.reusablePattern);
     sections.push('');
+    sections.push('**Confidence**');
+    sections.push(`${learning.evidenceQuality} ${learning.confidence}`);
+    sections.push('');
+    sections.push('**Evidence**');
+    sections.push(renderBulletParagraph(learning.supportingSources.map((source) => summarizeEvidenceSource(source, { includeExcerpt: true }))));
+    sections.push('');
     sections.push('**Follow-up**');
     sections.push(learning.followUp);
     sections.push('');
@@ -313,18 +332,19 @@ function renderPromptsNote(project) {
   const modulePreview = buildImportantModules(project).slice(0, 4).join(', ');
   const boundaryPreview = buildImportantBoundaries(project).slice(0, 2).join('; ');
   const debugSurface = buildImportantInterfaces(project).slice(0, 3).join(', ');
+  const validationPreview = buildValidationSurfaces(project).slice(0, 3).join('; ');
 
   return [
     `# ${project.name} Prompts`,
     '',
     '## Safe Change Prompt',
-    `Work in \`${project.name}\` without breaking ${boundaryPreview || 'the repo’s current boundaries'}. Identify the smallest module boundary first${modulePreview ? `, likely among ${modulePreview}` : ''}, then name the command or validation surface that proves the change is safe.`,
+    `Work in \`${project.name}\` without breaking ${boundaryPreview || 'the repo’s current boundaries'}. Identify the smallest module boundary first${modulePreview ? `, likely among ${modulePreview}` : ''}, then name the command or validation surface that proves the change is safe${validationPreview ? `, such as ${validationPreview}` : ''}.`,
     '',
     '## Boundary Recall Prompt',
     `Before a non-trivial edit in \`${project.name}\`, summarize the relevant modules, important interfaces, and risks from the notes and source files instead of starting from a stack overview.`,
     '',
     '## Debugging Prompt',
-    `Trace the issue through ${debugSurface || 'the main entrypoint, tests, and docs'} before changing surrounding code or UI copy. Name the failure mode and the nearest validation path.`,
+    `Trace the issue through ${debugSurface || 'the main entrypoint, tests, and docs'} before changing surrounding code or UI copy. Name the failure mode and the nearest validation path${validationPreview ? `, likely among ${validationPreview}` : ''}.`,
     '',
     '## Post-Fix Learning Prompt',
     'Capture a learning only if the work produced a real reusable guardrail, workflow improvement, or failure-mode fix. Skip cosmetic edits and obvious observations.',
@@ -538,8 +558,12 @@ function renderDocumentationStylePatternsNote(projects) {
     lines.push('');
     lines.push(`- Pattern: ${entry.pattern}`);
     lines.push(`- Seen in: ${entry.sourceProjects.join(', ')}`);
+    lines.push(`- Confidence: ${entry.evidenceQuality} ${entry.confidence}`);
     if (entry.evidencePaths.length > 0) {
       lines.push(`- Evidence: ${entry.evidencePaths.join(' | ')}`);
+    }
+    if (entry.supportingEvidence.length > 0) {
+      lines.push(`- Supporting excerpt: ${summarizeEvidenceSource(entry.supportingEvidence[0], { includeExcerpt: true })}`);
     }
     if (entry.qualitySignals.length > 0) {
       lines.push(`- Why it stands out: ${entry.qualitySignals.slice(0, 2).join(' ')}`);
@@ -553,16 +577,26 @@ function renderDocumentationStylePatternsNote(projects) {
 function buildDocumentationPatternCatalog(projects) {
   const catalog = new Map();
   for (const project of projects) {
-    for (const pattern of project.documentationPatterns ?? []) {
+    const documentationPatternRecords = (project.provenance?.documentationPatterns ?? []).length > 0
+      ? project.provenance.documentationPatterns
+      : (project.documentationPatterns ?? []).map((value) => ({ value, sources: [], evidenceQuality: 'weak', confidence: 0.48 }));
+    for (const patternRecord of documentationPatternRecords) {
+      const pattern = patternRecord?.value ?? '';
       const entry = catalog.get(pattern) ?? {
         pattern,
         sourceProjects: [],
         evidencePaths: [],
         qualitySignals: [],
+        supportingEvidence: [],
+        evidenceQuality: patternRecord?.evidenceQuality ?? 'weak',
+        confidence: Number(patternRecord?.confidence ?? 0),
       };
       entry.sourceProjects = uniqueStrings([...entry.sourceProjects, project.name]);
       entry.evidencePaths = uniqueStrings([...entry.evidencePaths, ...buildDocumentationEvidencePaths(project)]).slice(0, 4);
       entry.qualitySignals = uniqueStrings([...entry.qualitySignals, ...(project.documentationQualitySignals ?? []).slice(0, 2)]).slice(0, 4);
+      entry.supportingEvidence = mergeSupportingEvidence(entry.supportingEvidence, patternRecord?.sources ?? []);
+      entry.evidenceQuality = strongerEvidenceQuality(entry.evidenceQuality, patternRecord?.evidenceQuality ?? 'weak');
+      entry.confidence = Number(Math.max(entry.confidence, Number(patternRecord?.confidence ?? 0)).toFixed(4));
       catalog.set(pattern, entry);
     }
   }
@@ -666,6 +700,7 @@ function pickQueryHistorySection(sections, name, fallbackLines) {
 
 function buildImportantBoundaries(project) {
   return limitMeaningful(uniqueStrings([
+    ...(project.boundaryRules ?? []),
     ...project.architecture,
     ...project.riskNotes,
     ...project.workflows.filter((workflow) => /docs-as-code|verification surface|scriptable|read-only|local/i.test(workflow)),
@@ -683,6 +718,7 @@ function buildChangeGuidance(project) {
   const modules = buildImportantModules(project).slice(0, 3).join(', ');
   return limitMeaningful(uniqueStrings([
     modules ? `Change the smallest relevant boundary first, likely among: ${modules}.` : '',
+    ...buildValidationSurfaces(project).slice(0, 2).map((surface) => `Validate with: ${surface}.`),
     project.documentationPaths?.length ? `Open the nearest docs first: ${project.documentationPaths.slice(0, 2).join(', ')}.` : '',
     project.entryPoints?.length ? `Validate from the real entry surface: ${project.entryPoints.slice(0, 2).join(', ')}.` : '',
     project.riskNotes?.find((risk) => !/No elevated structural risks/i.test(risk)) ?? '',
@@ -701,15 +737,24 @@ function buildImportantInterfaces(project) {
   return limitMeaningful(uniqueStrings([
     ...(project.entryPoints ?? []).slice(0, 5).map((entryPoint) => `Entrypoint: ${entryPoint}`),
     ...(project.integrationSurfaces ?? []).slice(0, 5),
+    ...buildValidationSurfaces(project).slice(0, 3).map((surface) => `Validation: ${surface}`),
     ...(project.documentationPaths ?? []).slice(0, 3).map((docPath) => `Doc: ${docPath}`),
   ]), 6);
 }
 
 function buildArchitecturalConstraints(project) {
   return limitMeaningful(uniqueStrings([
+    ...(project.boundaryRules ?? []),
     ...project.riskNotes,
     ...(project.architecture ?? []).filter((pattern) => /boundary|state|offline|docs-as-code|local|operator|workflow/i.test(pattern)),
   ]), 5);
+}
+
+function buildValidationSurfaces(project) {
+  return limitMeaningful(uniqueStrings([
+    ...(project.validationSurfaces ?? []),
+    ...(project.workflows ?? []).filter((workflow) => /verification surface|tests|specs/i.test(workflow)),
+  ]), 6);
 }
 
 function buildSafeExtensionPoints(project) {
@@ -720,8 +765,18 @@ function buildSafeExtensionPoints(project) {
 }
 
 function buildStructuredLearnings(project) {
-  const problems = limitMeaningful(project.recurringProblems, 3).filter((problem) => !/artifact archive|reference fork/i.test(problem));
-  const solutions = limitMeaningful(project.reusableSolutions, 4);
+  const evidencePoints = (project.boundaryRules?.length ?? 0) + (project.validationSurfaces?.length ?? 0) + ((project.documentationQualityScore ?? 0) >= 6 ? 1 : 0);
+  if (evidencePoints < 2) {
+    return [];
+  }
+
+  const problems = limitMeaningful(project.recurringProblems, 3)
+    .filter((problem) => !/artifact archive|reference fork/i.test(problem))
+    .filter(isHighSignalLearningProblem);
+  const solutions = limitMeaningful(uniqueStrings([
+    ...(project.boundaryRules ?? []),
+    ...(project.reusableSolutions ?? []),
+  ]), 5).filter(isHighSignalLearningSolution);
   if (problems.length === 0 || solutions.length === 0) {
     return [];
   }
@@ -740,15 +795,75 @@ function buildStructuredLearnings(project) {
         `Purpose: ${firstMeaningful(project.purpose, project.summary, project.name)}`,
         project.stack?.length ? `Stack: ${project.stack.slice(0, 6).join(', ')}` : '',
         project.architecture?.length ? `Architecture: ${project.architecture.slice(0, 3).join('; ')}` : '',
+        project.boundaryRules?.length ? `Key boundaries: ${project.boundaryRules.slice(0, 3).join('; ')}` : '',
+        buildValidationSurfaces(project).length ? `Validation: ${buildValidationSurfaces(project).slice(0, 3).join('; ')}` : '',
         buildImportantModules(project).length ? `Key surfaces: ${buildImportantModules(project).slice(0, 5).join(', ')}` : '',
       ]), 4)),
       solution,
-      whyItWorked: firstMeaningful(project.architecture?.[0], project.workflows?.[0], 'The repo exposes enough structure to repeat the same solution safely.'),
-      reusablePattern: solution,
-      followUp: firstMeaningful(limitMeaningful(project.improvementIdeas, 1)[0], 'Validate the pattern again before promoting it further.'),
+      whyItWorked: firstMeaningful(project.boundaryRules?.[0], project.architecture?.[0], project.workflows?.[0], 'The repo exposes enough structure to repeat the same solution safely.'),
+      reusablePattern: firstMeaningful(project.reusableSolutions?.[index], solution),
+      ...buildLearningEvidence(project, problem, solution),
+      followUp: firstMeaningful(buildValidationSurfaces(project)[0], limitMeaningful(project.improvementIdeas, 1)[0], 'Validate the pattern again before promoting it further.'),
     });
   }
   return learnings;
+}
+
+function buildLearningEvidence(project, problem, solution) {
+  const candidates = pickTopEvidenceItems([
+    ...matchEvidenceItems(project.provenance?.recurringProblems ?? [], problem),
+    ...matchEvidenceItems(project.provenance?.reusableSolutions ?? [], solution),
+    ...pickTopEvidenceItems(project.provenance?.boundaryRules ?? [], 1),
+    ...pickTopEvidenceItems(project.provenance?.validationSurfaces ?? [], 1),
+  ], 3);
+
+  return {
+    evidenceQuality: maxEvidenceQuality(candidates),
+    confidence: Number(maxEvidenceConfidence(candidates).toFixed(4)),
+    supportingSources: mergeSupportingEvidence([], candidates.flatMap((item) => item.sources ?? [])),
+  };
+}
+
+function matchEvidenceItems(items, value) {
+  const normalizedValue = normalizeLine(value).toLowerCase();
+  return (items ?? []).filter((item) => {
+    const candidate = normalizeLine(item.value).toLowerCase();
+    return candidate === normalizedValue || candidate.includes(normalizedValue) || normalizedValue.includes(candidate);
+  });
+}
+
+function mergeSupportingEvidence(existingSources, newSources) {
+  const keyed = new Map();
+  for (const source of [...(existingSources ?? []), ...(newSources ?? [])].filter(Boolean)) {
+    const key = `${source.sourcePath}:${source.sourceSection ?? ''}:${source.excerpt ?? ''}`;
+    if (!keyed.has(key)) {
+      keyed.set(key, {
+        sourcePath: source.sourcePath,
+        sourceKind: source.sourceKind,
+        sourceSection: source.sourceSection ?? null,
+        excerpt: source.excerpt ?? '',
+      });
+    }
+  }
+  return [...keyed.values()].slice(0, 4);
+}
+
+function strongerEvidenceQuality(left, right) {
+  const rank = { weak: 1, medium: 2, strong: 3 };
+  return (rank[right] ?? 0) > (rank[left] ?? 0) ? right : left;
+}
+
+function isHighSignalLearningProblem(value) {
+  const normalized = normalizeLine(value).toLowerCase();
+  return isMeaningful(value) && /(read-only|local-first|runtime state|vault|repo-local|global state|artifact|evidence|boundary|contract|constraint|deterministic|snapshot|rewind|operator|secret|without|instead of|must|avoid|keep|preserve|limit|only)/i.test(normalized);
+}
+
+function isHighSignalLearningSolution(value) {
+  const normalized = normalizeLine(value).toLowerCase();
+  if (!isMeaningful(value)) {
+    return false;
+  }
+  return !/capture repeatable implementation decisions in dedicated notes/i.test(normalized);
 }
 
 function groupProjectsByConfidence(projects) {
@@ -853,6 +968,14 @@ function normalizeExtensionIdea(value) {
 
 function contentHashishEqual(left, right) {
   return stripLegacyManagedSections(left).trim() === stripLegacyManagedSections(right).trim();
+}
+
+function preserveCanonicalStaticContent(existing, fallbackContent) {
+  const cleaned = stripLegacyManagedSections(existing).trim();
+  if (!cleaned) {
+    return fallbackContent;
+  }
+  return cleaned;
 }
 
 async function createLocalRunner(config) {

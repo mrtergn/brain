@@ -48,6 +48,14 @@ Anything outside that model must justify itself against the core product story. 
 
 The point of the model is to keep retrieval trustworthy. Raw external summaries should not automatically become permanent memory.
 
+## Provenance and Trust Rules
+
+- Durable memory should carry explicit source traces whenever the repo exposes them. If Brain cannot support a claim, it should mark it as weak or omit it instead of inventing certainty.
+- Boundary rules and validation surfaces should come from repo evidence such as docs, agent guidance, or runnable scripts before they fall back to heuristics.
+- Retrieval and consultation should explain trust, not only semantic similarity. Local matches without strong support must remain visibly weaker than evidence-backed matches.
+- The vault may surface selective confidence and evidence lines for human readers, but it must not become a raw provenance dump or metadata mirror.
+- External findings do not become durable memory until they are proven enough to survive the promotion model above.
+
 ## Documentation Intelligence Rules
 
 - Documentation work should start from real repo evidence, not generic README boilerplate.
@@ -69,7 +77,7 @@ The point of the model is to keep retrieval trustworthy. Raw external summaries 
 - `brain:sync` may rewrite canonical note content and remove deprecated vault artifacts.
 - `brain:sync` must not recreate deprecated note types or marker boilerplate.
 - `brain:validate:vault` is the structural contract check.
-- `brain:doctor` is the operational contract check.
+- `brain:doctor` is the operational contract check, including provenance-aware query and consult smoke behavior.
 - `brain:init` must be rerun after launcher or MCP integration changes that affect generated runtime assets.
 
 ## Design Preferences

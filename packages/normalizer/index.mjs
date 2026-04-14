@@ -1,5 +1,11 @@
 import path from 'node:path';
 
+import {
+  createEvidenceItem,
+  createEvidenceSource,
+  EVIDENCE_MODEL_VERSION,
+  pickTopEvidenceItems,
+} from '../provenance/index.mjs';
 import { sha256, slugify, timestamp, uniqueStrings } from '../shared/index.mjs';
 
 export function normalizeProject(parsedProject) {
@@ -12,6 +18,13 @@ export function normalizeProject(parsedProject) {
   const tags = buildTags(analysis);
   const documentationPatterns = analysis.documentationPatterns ?? [];
   const documentationQualitySignals = analysis.documentationQualitySignals ?? [];
+  const boundaryRules = analysis.boundaryRules ?? [];
+  const validationSurfaces = analysis.validationSurfaces ?? [];
+  const provenance = normalizeProjectProvenance(analysis, {
+    modules,
+    workflows,
+    integrationSurfaces,
+  });
   const corpusSections = [
     `Project: ${analysis.name}`,
     `Purpose: ${analysis.purpose}`,
@@ -21,6 +34,8 @@ export function normalizeProject(parsedProject) {
     `Architecture: ${(analysis.architecturePatterns ?? []).join('; ')}`,
     `Modules: ${modules.join(', ')}`,
     `Workflows: ${workflows.join('; ')}`,
+    `Boundary rules: ${boundaryRules.join('; ')}`,
+    `Validation surfaces: ${validationSurfaces.join('; ')}`,
     `Integration surfaces: ${integrationSurfaces.join('; ')}`,
     `Recurring problems: ${(analysis.problemsSolved ?? []).join('; ')}`,
     `Reusable solutions: ${(analysis.reusablePatterns ?? []).join('; ')}`,
@@ -29,6 +44,7 @@ export function normalizeProject(parsedProject) {
     `Risk notes: ${riskNotes.join('; ')}`,
     `Improvement ideas: ${(analysis.potentialImprovements ?? []).join('; ')}`,
     `Prompt anchors: ${prompts.join('; ')}`,
+    `Evidence traces: ${buildEvidenceTraceSummary(provenance)}`,
   ];
 
   return {
@@ -36,6 +52,7 @@ export function normalizeProject(parsedProject) {
     slug: slugify(analysis.name),
     name: analysis.name,
     rootPath: analysis.rootPath,
+    evidenceModelVersion: analysis.evidenceModelVersion ?? EVIDENCE_MODEL_VERSION,
     fingerprint: analysis.fingerprint,
     parsedAt,
     normalizedAt: timestamp(),
@@ -47,6 +64,8 @@ export function normalizeProject(parsedProject) {
     modules,
     workflows,
     integrationSurfaces,
+    boundaryRules,
+    validationSurfaces,
     recurringProblems: analysis.problemsSolved ?? [],
     reusableSolutions: analysis.reusablePatterns ?? [],
     documentationPatterns,
@@ -60,6 +79,7 @@ export function normalizeProject(parsedProject) {
     sourceStats: analysis.sourceStats,
     warnings: analysis.warnings ?? [],
     tags,
+    provenance,
     corpusText: corpusSections.join('\n\n'),
     promptTemplateContext: {
       project: analysis.name,
@@ -70,6 +90,135 @@ export function normalizeProject(parsedProject) {
     noteTargets: buildNoteTargets(analysis.name),
     analysis,
   };
+}
+
+function normalizeProjectProvenance(analysis, { modules, workflows, integrationSurfaces }) {
+  return {
+    purpose: analysis.provenance?.purpose ?? createEvidenceItem({
+      category: 'purpose',
+      value: analysis.purpose,
+      sources: [],
+      derivedFrom: 'heuristic-fallback',
+      confidence: 0.34,
+      evidenceQuality: 'weak',
+    }),
+    architecture: analysis.provenance?.architecture ?? [],
+    modules: modules.map((moduleName) => createEvidenceItem({
+      category: 'modules',
+      value: moduleName,
+      sources: [createEvidenceSource({
+        sourcePath: moduleName,
+        sourceKind: 'directory',
+        sourceSection: 'top-level',
+        excerpt: `Detected top-level module boundary ${moduleName}.`,
+      })],
+      derivedFrom: 'directory-layout',
+    })).filter(Boolean),
+    workflows: buildWorkflowProvenance(analysis, workflows),
+    integrationSurfaces: buildIntegrationSurfaceProvenance(analysis, integrationSurfaces),
+    boundaryRules: analysis.provenance?.boundaryRules ?? [],
+    validationSurfaces: analysis.provenance?.validationSurfaces ?? [],
+    recurringProblems: analysis.provenance?.recurringProblems ?? [],
+    reusableSolutions: analysis.provenance?.reusableSolutions ?? [],
+    documentationPatterns: analysis.provenance?.documentationPatterns ?? [],
+    documentationQualitySignals: analysis.provenance?.documentationQualitySignals ?? [],
+  };
+}
+
+function buildWorkflowProvenance(analysis, workflows) {
+  return workflows.map((workflow) => {
+    if (/Entrypoint available at /i.test(workflow)) {
+      const entryPoint = workflow.replace(/^Entrypoint available at /i, '').trim();
+      return createEvidenceItem({
+        category: 'workflows',
+        value: workflow,
+        sources: [createEvidenceSource({
+          sourcePath: entryPoint,
+          sourceKind: 'manifest',
+          sourceSection: 'entrypoint',
+          excerpt: `Entrypoint discovered at ${entryPoint}.`,
+        })],
+        derivedFrom: 'package-manifest',
+      });
+    }
+    if (/docs-as-code/i.test(workflow)) {
+      return createEvidenceItem({
+        category: 'workflows',
+        value: workflow,
+        sources: (analysis.documentationPaths ?? []).slice(0, 2).map((relativePath) => createEvidenceSource({
+          sourcePath: relativePath,
+          sourceKind: 'doc',
+          sourceSection: 'documentation-surface',
+          excerpt: 'Documentation path participates in the operating surface.',
+        })),
+        derivedFrom: 'doc-structure',
+      });
+    }
+    if (/Automation-first/i.test(workflow)) {
+      const sources = (analysis.provenance?.validationSurfaces ?? []).slice(0, 2).flatMap((item) => item.sources ?? []);
+      return createEvidenceItem({
+        category: 'workflows',
+        value: workflow,
+        sources,
+        derivedFrom: sources.length > 0 ? 'manifest-script' : 'heuristic-inference',
+      });
+    }
+    if (/verification surface/i.test(workflow)) {
+      const sources = (analysis.provenance?.validationSurfaces ?? []).slice(0, 2).flatMap((item) => item.sources ?? []);
+      return createEvidenceItem({
+        category: 'workflows',
+        value: workflow,
+        sources,
+        derivedFrom: sources.length > 0 ? 'manifest-script' : 'heuristic-inference',
+      });
+    }
+    return createEvidenceItem({
+      category: 'workflows',
+      value: workflow,
+      sources: [],
+      derivedFrom: 'heuristic-inference',
+      confidence: 0.48,
+      evidenceQuality: 'weak',
+    });
+  }).filter(Boolean);
+}
+
+function buildIntegrationSurfaceProvenance(analysis, integrationSurfaces) {
+  return integrationSurfaces.map((surface) => {
+    const sourcePath = (analysis.entryPoints ?? [])[0] ?? (analysis.documentationPaths ?? [])[0] ?? analysis.rootPath;
+    const sourceKind = sourcePath === analysis.rootPath ? 'directory' : (/\.(md|mdx|rst|txt)$/i.test(sourcePath) ? 'doc' : 'manifest');
+    return createEvidenceItem({
+      category: 'integrationSurfaces',
+      value: surface,
+      sources: [createEvidenceSource({
+        sourcePath,
+        sourceKind,
+        sourceSection: sourceKind === 'directory' ? 'scan' : 'integration-surface',
+        excerpt: surface,
+      })],
+      derivedFrom: /No strong integration surfaces/i.test(surface) ? 'heuristic-inference' : 'package-manifest',
+      confidence: /No strong integration surfaces/i.test(surface) ? 0.38 : undefined,
+      evidenceQuality: /No strong integration surfaces/i.test(surface) ? 'weak' : undefined,
+    });
+  }).filter(Boolean);
+}
+
+function buildEvidenceTraceSummary(provenance) {
+  const highlights = [
+    provenance.purpose,
+    ...pickTopEvidenceItems(provenance.boundaryRules ?? [], 2),
+    ...pickTopEvidenceItems(provenance.validationSurfaces ?? [], 2),
+    ...pickTopEvidenceItems(provenance.documentationPatterns ?? [], 1),
+  ].filter(Boolean).slice(0, 6);
+
+  return highlights.map((item) => {
+    const firstSource = item.sources?.[0];
+    if (!firstSource) {
+      return `${item.category}: ${item.value} [${item.evidenceQuality}]`;
+    }
+    const section = firstSource.sourceSection ? ` > ${firstSource.sourceSection}` : '';
+    return `${item.category}: ${item.value} [${item.evidenceQuality} | ${firstSource.sourcePath}${section}]`;
+  }).join('; ');
 }
 
 function inferWorkflows(analysis) {
@@ -144,6 +293,9 @@ function buildPromptAnchors(analysis) {
     `Before changing ${analysis.name}, summarize the relevant modules, stack (${stackPreview}), and risks.`,
     `If I am debugging a similar issue, which ${analysis.name} notes should I read first?`,
   ];
+  if ((analysis.validationSurfaces ?? []).length > 0) {
+    prompts.push(`Which validation command or workflow proves a change in ${analysis.name} is safe?`);
+  }
   if ((analysis.documentationPatterns ?? []).length > 0) {
     prompts.push(`If I need to improve a README, architecture doc, or agent instructions, which documentation patterns from ${analysis.name} should I reuse?`);
   }

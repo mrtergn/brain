@@ -70,9 +70,9 @@ The system is healthy when all of the following are true:
 - `npm run brain:status` shows the expected paths and non-null `Last sync` and `Last embed` values.
 - `npm run brain:validate:vault` passes with no unexpected project notes, knowledge mirrors, marker sections, or runtime artifacts.
 - `npm run brain:doctor` passes and reports MCP as healthy.
-- `npm run brain:query -- "reusable pattern"` returns canonical note surfaces rather than deprecated ones.
+- `npm run brain:query -- "reusable pattern"` returns canonical note surfaces rather than deprecated ones, and the top result includes both matched and trusted reasons.
 - documentation-oriented retrieval returns strong README, architecture, operator-guide, or agent-instruction surfaces instead of generic markdown matches.
-- `npm run brain:consult -- "best practice for token refresh handling"` recommends web research for that current auth best-practice query.
+- `npm run brain:consult -- "best practice for token refresh handling"` recommends web research for that current auth best-practice query and prints a local trust basis before escalation.
 
 ## What Doctor Actually Checks
 
@@ -84,6 +84,7 @@ The system is healthy when all of the following are true:
 - missing embeddings and empty indexed-project state
 - query smoke results for a realistic retrieval prompt
 - consultation behavior for a current auth best-practice prompt
+- provenance-aware trust fields on query results and consult responses
 - MCP health and the presence of the expected `brain.*` tools
 
 If `doctor` fails, treat it as a runtime readiness problem, not just a documentation problem.
@@ -121,7 +122,9 @@ Per-project `logs.md` and per-project knowledge mirrors are deprecated. They are
 
 - Use `brain:consult` for real work. It adds mode selection, confidence scoring, source priorities, and memory guidance.
 - Use `brain:query` for retrieval debugging. It answers, “What did the local index match?” rather than, “What should I do next?”
+- If `brain:query` returns weak trust signals or thin supporting evidence, treat that as a cue to improve the prompt, refresh memory, or escalate through `brain:consult` instead of forcing a local-only answer.
 - For README, architecture-doc, operator-doc, or agent-instruction work, start with local documentation patterns before inventing new structure.
+- For repo-shaped implementation work, prefer prompts that name the boundary at risk and the validation surface you expect to use. The strengthened note model now surfaces both directly when the repo exposes them.
 - Use `brain.capture_learning` only for proven, reusable outcomes.
 - Use `brain.capture_research_candidate` only for promising findings that are not yet proven enough for durable memory.
 - Remember that `research-candidates.md` is not part of the semantic core by default.

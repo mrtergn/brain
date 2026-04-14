@@ -37,7 +37,6 @@ import { startWatchLoop } from '../../packages/watcher/index.mjs';
 
 const KNOWLEDGE_MODEL_VERSION = 'canonical-v1';
 const execFileAsync = promisify(execFile);
-const DEPRECATED_RETRIEVAL_NOTE_TYPES = new Set(['knowledge', 'logs']);
 
 export async function runInit(options = {}) {
   const config = buildRuntimeConfig(options);
@@ -367,6 +366,15 @@ export async function runDoctor(options = {}) {
     if (queryCheck.results.length === 0) {
       issues.push('Query smoke test returned no results.');
     }
+    if (queryCheck.results.length > 0) {
+      const topResult = queryCheck.results[0];
+      if (!topResult.evidenceQuality || typeof topResult.confidence !== 'number') {
+        issues.push('Query smoke test returned results without provenance-aware trust fields.');
+      }
+      if (!Array.isArray(topResult.supportingSources)) {
+        issues.push('Query smoke test returned results without supporting evidence traces.');
+      }
+    }
     const deprecatedQueryResult = queryCheck.results.find((result) => {
       if (result.noteType === 'logs' || (result.noteType === 'knowledge' && !isCanonicalKnowledgeBasePath(String(result.sourcePath ?? '')))) {
         return true;
@@ -388,6 +396,9 @@ export async function runDoctor(options = {}) {
     }
     if (consultCheck.researchDecision.needsWebResearch !== true) {
       issues.push('Consult smoke test did not recommend web research for a current auth best-practice query.');
+    }
+    if (!consultCheck.trustSummary || !Array.isArray(consultCheck.evidence?.topResults)) {
+      issues.push('Consult smoke test returned without provenance-aware trust summary fields.');
     }
   }
 

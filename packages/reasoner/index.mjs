@@ -22,7 +22,7 @@ export async function reasonAboutQuery(config, state, retrievalResponse) {
   }
 
   const solutionSuggestions = topResults.slice(0, 3).map((result) => {
-    return `Start from ${result.project} (${result.noteType}) because it scored ${result.relevanceScore} and mentions: ${result.snippet}`;
+    return `Start from ${result.project} (${result.noteType}) because it scored ${result.relevanceScore}, ${result.whyMatched}, and is trusted because ${result.whyTrusted}. Snippet: ${result.snippet}`;
   });
 
   const patternLinks = uniqueStrings(topResults.map((result) => `${result.project} -> ${result.noteType}`)).slice(0, 6);
@@ -45,7 +45,7 @@ export async function reasonAboutQuery(config, state, retrievalResponse) {
 
 function renderPrompt(template, queryText, results) {
   const evidence = results
-    .map((result, index) => `${index + 1}. ${result.project}/${result.noteType} (${result.relevanceScore}) -> ${truncate(result.snippet, 220)}`)
+    .map((result, index) => `${index + 1}. ${result.project}/${result.noteType} (${result.relevanceScore}) -> ${truncate(result.snippet, 220)} | trust: ${truncate(result.whyTrusted ?? '', 160)}`)
     .join('\n');
 
   return template

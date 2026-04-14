@@ -62,7 +62,7 @@ export async function shutdownEmbeddingService() {
   const service = await sharedServicePromise.catch(() => null);
   sharedServicePromise = null;
   if (service) {
-    service.close();
+    await service.close();
   }
 }
 
@@ -162,16 +162,40 @@ class PythonEmbeddingService {
   }
 
   async reset() {
-    this.close();
+    await this.close();
     sharedServicePromise = null;
   }
 
-  close() {
+  async close() {
     this.closed = true;
-    if (this.process && !this.process.killed) {
-      this.process.kill();
+    const child = this.process;
+    if (!child) {
+      this.process = null;
+      return;
     }
-    this.process = null;
+    if (child.killed) {
+      this.process = null;
+      return;
+    }
+
+    await new Promise((resolve) => {
+      let finished = false;
+      const finalize = () => {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        resolve();
+      };
+
+      child.once('close', finalize);
+      child.kill();
+      setTimeout(finalize, 2000);
+    });
+
+    if (this.process === child) {
+      this.process = null;
+    }
   }
 
   handleStdout(chunk) {

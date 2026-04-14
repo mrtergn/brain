@@ -6,8 +6,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 
 import { buildResearchConsultation, synthesizeLocalAndExternalGuidance } from '../packages/research/index.mjs';
 import { BRAIN_MCP_TOOL_NAMES } from '../apps/mcp-server/index.mjs';
-import { chunkProjectKnowledge } from '../packages/chunker/index.mjs';
+import { buildProjectKnowledgeSources, chunkProjectKnowledge } from '../packages/chunker/index.mjs';
 import { LocalSemanticEmbedder, shutdownEmbeddingService } from '../packages/embeddings/index.mjs';
+import { normalizeProject } from '../packages/normalizer/index.mjs';
 import { writeQueryHistoryNote } from '../packages/obsidian-writer/index.mjs';
 import { expandQueryText } from '../packages/retriever/index.mjs';
 import { normalizeState } from '../packages/state-manager/index.mjs';
@@ -130,6 +131,151 @@ test('project analysis extracts documentation-style patterns from strong repo su
   assert.ok(analysis.documentationPatterns.some((pattern) => pattern.includes('Agent guidance pattern')));
 });
 
+test('project analysis extracts boundary rules and validation surfaces from docs instead of fallback summaries', async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'brain-signal-quality-'));
+  TEMP_PATHS.push(projectRoot);
+
+  await writeFile(path.join(projectRoot, 'README.md'), [
+    '# Signal Quality Repo',
+    '',
+    '- Source repositories are read-only inputs.',
+    '- Keep runtime state under data/ instead of the knowledge vault.',
+    '',
+    '```bash',
+    'npm run doctor',
+    'npm run validate:vault',
+    '```',
+  ].join('\n'), 'utf8');
+
+  await writeFile(path.join(projectRoot, 'package.json'), JSON.stringify({
+    name: 'signal-quality-repo',
+    private: true,
+    scripts: {
+      doctor: 'node doctor.mjs',
+      test: 'node --test',
+    },
+  }, null, 2), 'utf8');
+
+  const analysis = await analyzeProject(projectRoot);
+
+  assert.ok(analysis.boundaryRules.some((rule) => /read-only inputs/i.test(rule)));
+  assert.ok(analysis.validationSurfaces.some((surface) => /npm run doctor/i.test(surface)));
+  assert.ok(analysis.problemsSolved.every((problem) => !/locally indexed software project tracked/i.test(problem)));
+});
+
+test('project analysis preserves provenance with source path, section, excerpt, and confidence', async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'brain-provenance-'));
+  TEMP_PATHS.push(projectRoot);
+
+  await writeFile(path.join(projectRoot, 'README.md'), [
+    '# Provenance Repo',
+    '',
+    '## Boundaries',
+    '- Source repositories are read-only inputs.',
+    '- Keep runtime state under data/ instead of the vault.',
+    '',
+    '## Validation',
+    '```bash',
+    'npm run doctor',
+    '```',
+  ].join('\n'), 'utf8');
+
+  await writeFile(path.join(projectRoot, 'package.json'), JSON.stringify({
+    name: 'provenance-repo',
+    private: true,
+    scripts: {
+      doctor: 'node doctor.mjs',
+    },
+  }, null, 2), 'utf8');
+
+  const analysis = await analyzeProject(projectRoot);
+
+  assert.equal(analysis.evidenceModelVersion, 'provenance-v1');
+  const boundary = analysis.provenance.boundaryRules.find((item) => /read-only inputs/i.test(item.value));
+  assert.ok(boundary);
+  assert.equal(boundary.evidenceQuality, 'strong');
+  assert.equal(boundary.sources[0].sourcePath, 'README.md');
+  assert.equal(boundary.sources[0].sourceSection, 'Boundaries');
+  assert.match(boundary.sources[0].excerpt, /read-only inputs/i);
+
+  const validation = analysis.provenance.validationSurfaces.find((item) => /brain:doctor|doctor/i.test(item.value));
+  assert.ok(validation);
+  assert.ok(validation.confidence > 0.7);
+
+  const documentedValidation = analysis.provenance.validationSurfaces.find((item) => /npm run doctor/i.test(item.value));
+  assert.ok(documentedValidation);
+  assert.equal(documentedValidation.sources[0].sourcePath, 'README.md');
+
+  const scriptedValidation = analysis.provenance.validationSurfaces.find((item) => /Package script: doctor: node doctor\.mjs/i.test(item.value));
+  assert.ok(scriptedValidation);
+  assert.equal(scriptedValidation.sources[0].sourcePath, 'package.json');
+});
+
+test('normalizer preserves provenance and emits evidence traces into corpus text', async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'brain-normalized-provenance-'));
+  TEMP_PATHS.push(projectRoot);
+
+  await mkdir(path.join(projectRoot, 'docs'), { recursive: true });
+  await writeFile(path.join(projectRoot, 'README.md'), [
+    '# Normalized Provenance Repo',
+    '',
+    '- Source repositories are read-only inputs.',
+    '',
+    '```bash',
+    'npm run doctor',
+    '```',
+  ].join('\n'), 'utf8');
+  await writeFile(path.join(projectRoot, 'package.json'), JSON.stringify({
+    name: 'normalized-provenance-repo',
+    private: true,
+    scripts: {
+      doctor: 'node doctor.mjs',
+    },
+  }, null, 2), 'utf8');
+
+  const analysis = await analyzeProject(projectRoot);
+  const normalized = normalizeProject({ projectRoot, analysis, parsedAt: '2026-04-12T00:00:00.000Z' });
+
+  assert.equal(normalized.evidenceModelVersion, 'provenance-v1');
+  assert.ok(normalized.provenance.boundaryRules.length > 0);
+  assert.equal(normalized.provenance.boundaryRules[0].sources[0].sourcePath, 'README.md');
+  assert.match(normalized.corpusText, /Evidence traces:/);
+});
+
+test('chunker emits provenance-aware metadata for normalized project chunks', async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'brain-chunk-provenance-'));
+  TEMP_PATHS.push(projectRoot);
+
+  await writeFile(path.join(projectRoot, 'README.md'), [
+    '# Chunk Provenance Repo',
+    '',
+    '- Keep runtime state under data/ instead of the vault.',
+    '',
+    '```bash',
+    'npm run doctor',
+    '```',
+  ].join('\n'), 'utf8');
+  await writeFile(path.join(projectRoot, 'package.json'), JSON.stringify({
+    name: 'chunk-provenance-repo',
+    private: true,
+    scripts: {
+      doctor: 'node doctor.mjs',
+    },
+  }, null, 2), 'utf8');
+
+  const analysis = await analyzeProject(projectRoot);
+  const normalized = normalizeProject({ projectRoot, analysis, parsedAt: '2026-04-12T00:00:00.000Z' });
+  const sources = buildProjectKnowledgeSources(normalized, {});
+  const chunks = chunkProjectKnowledge(normalized, sources, { maxChars: 220, overlapChars: 40 });
+
+  assert.ok(chunks.length > 0);
+  assert.equal(chunks[0].metadata.knowledgeType, 'project-snapshot');
+  assert.ok(['weak', 'medium', 'strong'].includes(chunks[0].metadata.evidenceQuality));
+  assert.ok(typeof chunks[0].metadata.confidence === 'number');
+  assert.ok(typeof chunks[0].metadata.evidenceSummary === 'string');
+  assert.ok(chunks[0].metadata.supportingSources.includes('sourcePath'));
+});
+
 test('research consultation escalates token refresh best-practice queries to web-first mode', () => {
   const consultation = buildResearchConsultation({
     query: 'best practice for token refresh handling',
@@ -232,6 +378,63 @@ test('research consultation stays local-only for repo-shaped questions with stro
   assert.equal(consultation.researchDecision.needsWebResearch, false);
 });
 
+test('research consultation stays local-only for medium-confidence repo-specific retry boundary questions', () => {
+  const consultation = buildResearchConsultation({
+    query: 'safe place in this repo to change retry logic without breaking the shared client boundary',
+    currentProjectName: 'brain',
+    currentProjectPath: '/tmp/brain',
+    retrievalResponse: {
+      results: [
+        {
+          project: 'brain',
+          noteType: 'learnings',
+          sourcePath: '/tmp/brain/learnings.md',
+          relevanceScore: 0.61,
+          whyMatched: 'same project reusable retry boundary',
+          snippet: 'Place retry behavior at the shared client boundary instead of scattering retries across callers.',
+          matchedTerms: ['retry', 'shared', 'client', 'boundary'],
+        },
+        {
+          project: 'brain',
+          noteType: 'prompts',
+          sourcePath: '/tmp/brain/prompts.md',
+          relevanceScore: 0.55,
+          whyMatched: 'same project safe-change prompt',
+          snippet: 'Name the command or validation surface that proves the change is safe.',
+          matchedTerms: ['safe', 'change', 'boundary'],
+        },
+      ],
+    },
+    reasoning: {
+      relatedProjects: ['brain'],
+      improvementRecommendations: [],
+    },
+    projectSummary: {
+      relevantLearnings: {
+        solution: ['Place retry behavior at the shared client boundary instead of scattering retries across callers.'],
+        reusablePattern: ['Central retry wrapper for outbound API clients'],
+        whyItWorked: ['Shared wrappers keep retry behavior consistent.'],
+      },
+      projectPatterns: ['Central retry wrapper for outbound API clients'],
+      documentationPatterns: [],
+      noteReferences: {
+        overview: '/tmp/brain/overview.md',
+        architecture: '/tmp/brain/architecture.md',
+        learnings: '/tmp/brain/learnings.md',
+        prompts: '/tmp/brain/prompts.md',
+        knowledge: '/tmp/brain/reusable-patterns.md',
+        documentationStyle: '/tmp/brain/documentation-style-patterns.md',
+      },
+      stack: ['JavaScript', 'Node.js'],
+    },
+    relatedPatterns: [],
+    recentLearnings: [],
+  });
+
+  assert.equal(consultation.mode, 'local-only');
+  assert.equal(consultation.researchDecision.needsWebResearch, false);
+});
+
 test('research consultation reuses documentation-style patterns for repo-facing doc tasks', () => {
   const consultation = buildResearchConsultation({
     query: 'how should this repo README and AGENTS docs look',
@@ -277,6 +480,125 @@ test('research consultation reuses documentation-style patterns for repo-facing 
   });
 
   assert.ok(consultation.localContext.projectPatterns.some((pattern) => pattern.includes('README opening sequence pattern')));
+});
+
+test('research consultation exposes trust summary and local evidence basis', () => {
+  const consultation = buildResearchConsultation({
+    query: 'safe place in this repo to change retry logic without breaking the shared client boundary',
+    currentProjectName: 'brain',
+    currentProjectPath: '/tmp/brain',
+    retrievalResponse: {
+      results: [
+        {
+          project: 'brain',
+          noteType: 'learnings',
+          sourcePath: '/tmp/brain/learnings.md',
+          sourceKind: 'note',
+          relevanceScore: 0.78,
+          whyMatched: 'same project boundary match',
+          whyTrusted: 'source is a structured learning note; evidence quality: strong; confidence: 0.88',
+          snippet: 'Place retry behavior at the shared client boundary instead of scattering retries across callers.',
+          matchedTerms: ['retry', 'boundary'],
+          evidenceQuality: 'strong',
+          confidence: 0.88,
+          supportCount: 2,
+          supportingSources: [
+            {
+              sourcePath: 'README.md',
+              sourceKind: 'readme',
+              sourceSection: 'Boundaries',
+              excerpt: 'Place retry behavior at the shared client boundary.',
+            },
+          ],
+        },
+      ],
+    },
+    reasoning: {
+      relatedProjects: ['brain'],
+      improvementRecommendations: [],
+    },
+    projectSummary: {
+      relevantLearnings: {
+        problem: 'Retry logic can fragment across callers.',
+        solution: ['Place retry behavior at the shared client boundary instead of scattering retries across callers.'],
+        whyItWorked: ['Shared wrappers keep retry behavior consistent.'],
+        reusablePattern: ['Central retry wrapper for outbound API clients'],
+        followUp: [],
+        evidenceQuality: 'strong',
+        confidence: 0.88,
+        supportingSources: [
+          {
+            sourcePath: 'README.md',
+            sourceKind: 'readme',
+            sourceSection: 'Boundaries',
+            excerpt: 'Place retry behavior at the shared client boundary.',
+          },
+        ],
+      },
+      projectPatterns: ['Central retry wrapper for outbound API clients'],
+      documentationPatterns: [],
+      provenance: {
+        purpose: null,
+        boundaries: [
+          {
+            id: '1',
+            category: 'boundaryRules',
+            value: 'Place retry behavior at the shared client boundary instead of scattering retries across callers.',
+            confidence: 0.88,
+            evidenceQuality: 'strong',
+            derivedFrom: 'explicit-doc',
+            supportCount: 1,
+            sources: [
+              {
+                sourcePath: 'README.md',
+                sourceKind: 'readme',
+                sourceSection: 'Boundaries',
+                excerpt: 'Place retry behavior at the shared client boundary.',
+              },
+            ],
+          },
+        ],
+        validationSurfaces: [],
+        reusableSolutions: [],
+        documentationPatterns: [],
+      },
+      noteReferences: {
+        overview: '/tmp/brain/overview.md',
+        architecture: '/tmp/brain/architecture.md',
+        learnings: '/tmp/brain/learnings.md',
+        prompts: '/tmp/brain/prompts.md',
+        knowledge: '/tmp/brain/reusable-patterns.md',
+        documentationStyle: '/tmp/brain/documentation-style-patterns.md',
+      },
+      stack: ['JavaScript', 'Node.js'],
+    },
+    relatedPatterns: [
+      {
+        patternTitle: 'Central retry wrapper for outbound API clients',
+        explanation: 'Reuse when the project needs retry policy at a shared transport boundary.',
+        sourceProjects: ['brain'],
+        supportingEvidence: [
+          {
+            sourcePath: 'README.md',
+            sourceKind: 'readme',
+            sourceSection: 'Boundaries',
+            excerpt: 'Place retry behavior at the shared client boundary.',
+          },
+        ],
+        evidenceQuality: 'strong',
+        confidence: 0.84,
+        supportCount: 1,
+        whyTrusted: 'evidence quality: strong; confidence: 0.84',
+        relevanceScore: 0.84,
+      },
+    ],
+    recentLearnings: [],
+  });
+
+  assert.equal(consultation.trustSummary.localEvidenceQuality, 'strong');
+  assert.ok(consultation.trustSummary.strongestBasis.some((item) => item.includes('README.md')));
+  assert.ok(consultation.localContext.evidenceBasis.some((item) => item.includes('README.md')));
+  assert.equal(consultation.evidence.topResults[0].supportingSources[0].sourcePath, 'README.md');
 });
 
 test('guidance synthesis promotes retry guidance to a reusable pattern only when local and external evidence align', () => {

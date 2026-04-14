@@ -257,6 +257,7 @@ export function buildResearchConsultation({
     query: normalizedQuery,
     projectSummary,
     localConfidence,
+    currentProjectName,
   });
   const mode = decideConsultationMode({
     signals,
@@ -286,6 +287,14 @@ export function buildResearchConsultation({
     localConfidence,
     localContext,
   });
+  const trustSummary = buildConsultationTrustSummary({
+    mode,
+    signals,
+    localConfidence,
+    retrievalResponse,
+    projectSummary,
+    relatedPatterns,
+  });
   const researchDecision = {
     needsWebResearch: mode !== CONSULTATION_MODES.LOCAL_ONLY,
     triggers: signals.triggers,
@@ -304,19 +313,31 @@ export function buildResearchConsultation({
     researchPlan,
     synthesis,
     memoryGuidance,
+    trustSummary,
     evidence: {
       topResults: (retrievalResponse?.results ?? []).slice(0, 5).map((result) => ({
         project: result.project,
         noteType: result.noteType,
         sourcePath: result.sourcePath,
+        sourceKind: result.sourceKind,
         relevanceScore: result.relevanceScore,
         whyMatched: result.whyMatched,
+        whyTrusted: result.whyTrusted,
+        evidenceQuality: result.evidenceQuality,
+        confidence: result.confidence,
+        supportCount: result.supportCount,
+        supportingSources: result.supportingSources ?? [],
         snippet: truncate(result.snippet ?? result.document ?? '', 220),
       })),
       relatedPatterns: (relatedPatterns ?? []).slice(0, 4).map((pattern) => ({
         patternTitle: pattern.patternTitle,
         explanation: pattern.explanation,
         sourceProjects: pattern.sourceProjects,
+        evidenceQuality: pattern.evidenceQuality,
+        confidence: pattern.confidence,
+        supportCount: pattern.supportCount,
+        supportingEvidence: pattern.supportingEvidence ?? [],
+        whyTrusted: pattern.whyTrusted,
         relevanceScore: pattern.relevanceScore,
       })),
       recentLearnings: (recentLearnings ?? []).slice(0, 4),
@@ -402,7 +423,7 @@ function scoreLocalConfidence({ retrievalResponse, currentProjectName, projectSu
     ? topThree.reduce((total, result) => total + Number(result.relevanceScore ?? 0), 0) / topThree.length
     : 0;
   const currentProjectHit = Boolean(currentProjectName && topThree.some((result) => result.project === currentProjectName));
-  const reusableKnowledgeHit = topThree.some((result) => result.noteType === 'knowledge' || /(reusable-patterns|documentation-style-patterns)/i.test(result.sourcePath ?? ''));
+  const reusableKnowledgeHit = topThree.some((result) => /(reusable-patterns|documentation-style-patterns)/i.test(result.sourcePath ?? ''));
   const matchedTerms = uniqueStrings(topThree.flatMap((result) => result.matchedTerms ?? []));
 
   let score = 0;
@@ -411,6 +432,8 @@ function scoreLocalConfidence({ retrievalResponse, currentProjectName, projectSu
   score += clamp(averageTopScore, 0, 1) * 0.22;
   score += currentProjectHit ? 0.14 : 0;
   score += reusableKnowledgeHit ? 0.07 : 0;
+  score += topThree.some((result) => result.evidenceQuality === 'strong') ? 0.08 : 0;
+  score += topThree.some((result) => result.supportCount >= 2) ? 0.04 : 0;
   score += Math.min(matchedTerms.length * 0.02, 0.05);
   score += projectSummary ? 0.04 : 0;
 
@@ -434,6 +457,12 @@ function scoreLocalConfidence({ retrievalResponse, currentProjectName, projectSu
   }
   if (reusableKnowledgeHit) {
     strongSignals.push('Reusable knowledge or pattern notes are present near the top of the results.');
+  }
+  if (topThree.some((result) => result.evidenceQuality === 'strong')) {
+    strongSignals.push('Top local evidence is backed by strong source traces, not only semantic similarity.');
+  }
+  if (topThree.some((result) => result.supportCount >= 2)) {
+    strongSignals.push('At least one local result is supported by multiple evidence traces.');
   }
   if (results.length < 3) {
     weakSignals.push('The local brain returned only a shallow result set.');
@@ -463,7 +492,7 @@ function scoreLocalConfidence({ retrievalResponse, currentProjectName, projectSu
   };
 }
 
-function detectResearchSignals({ query, projectSummary, localConfidence } = {}) {
+function detectResearchSignals({ query, projectSummary, localConfidence, currentProjectName } = {}) {
   const queryText = String(query ?? '').trim();
   const lowerQuery = queryText.toLowerCase();
   const queryTokens = new Set(tokenize(queryText));
@@ -478,6 +507,8 @@ function detectResearchSignals({ query, projectSummary, localConfidence } = {}) 
   const newLibraryUsage = /sdk|library|framework|integration|how to use|usage pattern|client\b|api reference|official api/i.test(lowerQuery);
   const testing = /test|testing|playwright|jest|vitest|pytest/i.test(lowerQuery);
   const fastMoving = technologies.some((token) => FAST_MOVING_TECHS.has(token)) || currentGuidance;
+  const repoSpecific = /this repo|this project|current project|without breaking|safe place|boundary|module|workflow|entrypoint|operator|vault|repo-local|existing pattern|codebase/i.test(lowerQuery)
+    || (currentProjectName ? lowerQuery.includes(String(currentProjectName).toLowerCase()) : false);
 
   const triggers = [];
   if (currentGuidance) {
@@ -515,11 +546,13 @@ function detectResearchSignals({ query, projectSummary, localConfidence } = {}) 
     newLibraryUsage,
     testing,
     fastMoving,
+    repoSpecific,
     triggers: uniqueStrings(triggers),
   };
 }
 
 function decideConsultationMode({ signals, localConfidence } = {}) {
+  const explicitCurrentResearch = signals?.currentGuidance || signals?.versionSpecific || signals?.migration;
   const webFirst = signals?.migration
     || signals?.versionSpecific
     || (signals?.currentGuidance && (signals?.fastMoving || signals?.securitySensitive))
@@ -530,11 +563,12 @@ function decideConsultationMode({ signals, localConfidence } = {}) {
     return CONSULTATION_MODES.WEB_FIRST_LOCAL_ADAPTATION;
   }
 
-  const webAssist = signals?.currentGuidance
-    || signals?.securitySensitive
-    || signals?.resilience
-    || signals?.newLibraryUsage
-    || signals?.fastMoving
+  if (signals?.repoSpecific && localConfidence?.level !== 'low' && !explicitCurrentResearch) {
+    return CONSULTATION_MODES.LOCAL_ONLY;
+  }
+
+  const webAssist = explicitCurrentResearch
+    || ((signals?.securitySensitive || signals?.resilience || signals?.newLibraryUsage || signals?.fastMoving) && (!signals?.repoSpecific || localConfidence?.level === 'low'))
     || localConfidence?.level === 'low';
 
   if (webAssist) {
@@ -561,6 +595,7 @@ function buildLocalContext({ retrievalResponse, reasoning, projectSummary, relat
       ...(projectSummary?.documentationPatterns ?? []),
       ...(relatedPatterns ?? []).map((pattern) => pattern.patternTitle),
     ]).slice(0, 6),
+    evidenceBasis: buildLocalEvidenceBasis({ retrievalResponse, projectSummary, relatedPatterns }),
     noteReferences: projectSummary?.noteReferences ?? {
       overview: null,
       architecture: null,
@@ -570,6 +605,62 @@ function buildLocalContext({ retrievalResponse, reasoning, projectSummary, relat
       documentationStyle: null,
     },
   };
+}
+
+function buildConsultationTrustSummary({ mode, signals, localConfidence, retrievalResponse, projectSummary, relatedPatterns }) {
+  const topResults = (retrievalResponse?.results ?? []).slice(0, 3);
+  const strongestSources = uniqueStrings(topResults.flatMap((result) => (result.supportingSources ?? []).map((source) => [source.sourcePath, source.sourceSection].filter(Boolean).join(' > ')))).slice(0, 4);
+  const localEvidenceQuality = topResults.some((result) => result.evidenceQuality === 'strong')
+    ? 'strong'
+    : (topResults.some((result) => result.evidenceQuality === 'medium') ? 'medium' : 'weak');
+  const strongestBasis = uniqueStrings([
+    strongestSources.length > 0 ? `Local evidence traces come from ${strongestSources.join(' | ')}.` : '',
+    (projectSummary?.provenance?.documentationPatterns ?? []).length > 0 ? 'Documentation guidance is backed by repo-derived documentation-pattern evidence.' : '',
+    (relatedPatterns ?? []).some((pattern) => pattern.evidenceQuality === 'strong') ? 'Reusable patterns include strongly supported cross-project evidence.' : '',
+  ]).slice(0, 4);
+  const weakerAreas = uniqueStrings([
+    localConfidence?.level === 'low' ? 'Local confidence is low, so any implementation advice should be validated against the actual code and external sources.' : '',
+    topResults.some((result) => result.evidenceQuality === 'weak') ? 'Some top local matches are still heuristic or lightly supported.' : '',
+    mode !== CONSULTATION_MODES.LOCAL_ONLY && signals?.repoSpecific ? 'The task is repo-shaped, but external guidance was still needed because local trust signals were not sufficient on their own.' : '',
+  ]).slice(0, 4);
+
+  return {
+    localEvidenceQuality,
+    strongestBasis,
+    weakerAreas,
+    usedExternalGuidance: mode !== CONSULTATION_MODES.LOCAL_ONLY,
+    usedExternalGuidanceBecause: mode === CONSULTATION_MODES.LOCAL_ONLY
+      ? null
+      : buildExternalGuidanceReason(signals, localConfidence),
+  };
+}
+
+function buildLocalEvidenceBasis({ retrievalResponse, projectSummary, relatedPatterns }) {
+  const topResults = (retrievalResponse?.results ?? []).slice(0, 3);
+  return uniqueStrings([
+    ...topResults.map((result) => {
+      const firstSource = result.supportingSources?.[0];
+      if (!firstSource) {
+        return `${result.project}/${result.noteType} (${result.evidenceQuality})`;
+      }
+      return `${result.project}/${result.noteType} (${result.evidenceQuality}) from ${[firstSource.sourcePath, firstSource.sourceSection].filter(Boolean).join(' > ')}`;
+    }),
+    ...(projectSummary?.provenance?.boundaries ?? []).slice(0, 2).map((item) => `Boundary evidence: ${item.value}`),
+    ...(relatedPatterns ?? []).slice(0, 2).map((pattern) => `Reusable pattern evidence: ${pattern.patternTitle} (${pattern.evidenceQuality})`),
+  ]).slice(0, 6);
+}
+
+function buildExternalGuidanceReason(signals, localConfidence) {
+  if (signals?.currentGuidance || signals?.versionSpecific || signals?.migration) {
+    return 'The query asks for current, version-sensitive, or migration-sensitive guidance.';
+  }
+  if (signals?.securitySensitive) {
+    return 'The topic is security-sensitive enough that official guidance should verify the local answer.';
+  }
+  if (localConfidence?.level === 'low') {
+    return 'Local evidence quality and recall were too weak to trust a local-only answer.';
+  }
+  return 'External guidance was used to reinforce trust where local evidence was incomplete.';
 }
 
 function buildResearchPlan({ query, signals, projectSummary, mode } = {}) {
@@ -663,6 +754,9 @@ function buildDecisionRationale({ mode, signals, localConfidence } = {}) {
   const reasons = [];
   if (mode === CONSULTATION_MODES.LOCAL_ONLY) {
     reasons.push('Local confidence is high enough that repo memory should lead the implementation.');
+  }
+  if (signals?.repoSpecific && localConfidence?.level !== 'low' && !signals?.currentGuidance && !signals?.versionSpecific && !signals?.migration) {
+    reasons.push('The question is repo-specific and local recall is strong enough to avoid unnecessary web escalation.');
   }
   if (signals?.currentGuidance) {
     reasons.push('The query explicitly asks for up-to-date or recommended practice.');
