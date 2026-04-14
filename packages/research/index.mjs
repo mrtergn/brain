@@ -248,10 +248,16 @@ export function buildResearchConsultation({
   recentLearnings,
 } = {}) {
   const normalizedQuery = String(query ?? '').trim();
+  const initialSignals = detectResearchSignals({
+    query: normalizedQuery,
+    projectSummary,
+    currentProjectName,
+  });
   const localConfidence = scoreLocalConfidence({
     retrievalResponse,
     currentProjectName,
     projectSummary,
+    repoSpecific: initialSignals.repoSpecific,
   });
   const signals = detectResearchSignals({
     query: normalizedQuery,
@@ -268,6 +274,7 @@ export function buildResearchConsultation({
     reasoning,
     projectSummary,
     relatedPatterns,
+    currentProjectName,
   });
   const researchPlan = buildResearchPlan({
     query: normalizedQuery,
@@ -294,6 +301,7 @@ export function buildResearchConsultation({
     retrievalResponse,
     projectSummary,
     relatedPatterns,
+    currentProjectName,
   });
   const researchDecision = {
     needsWebResearch: mode !== CONSULTATION_MODES.LOCAL_ONLY,
@@ -415,10 +423,16 @@ export function synthesizeLocalAndExternalGuidance({ consultation, externalFindi
   };
 }
 
-function scoreLocalConfidence({ retrievalResponse, currentProjectName, projectSummary } = {}) {
+function scoreLocalConfidence({ retrievalResponse, currentProjectName, projectSummary, repoSpecific = false } = {}) {
   const results = retrievalResponse?.results ?? [];
-  const topScore = Number(results[0]?.relevanceScore ?? 0);
-  const topThree = results.slice(0, 3);
+  const topResults = results.slice(0, 5);
+  const topScore = Number(topResults[0]?.relevanceScore ?? 0);
+  const topThree = topResults.slice(0, 3);
+  const currentProjectResults = currentProjectName
+    ? topResults.filter((result) => result.project === currentProjectName)
+    : [];
+  const currentProjectTopScore = Number(currentProjectResults[0]?.relevanceScore ?? 0);
+  const topCrossProjectScore = Number(topResults.find((result) => result.project !== currentProjectName)?.relevanceScore ?? 0);
   const averageTopScore = topThree.length > 0
     ? topThree.reduce((total, result) => total + Number(result.relevanceScore ?? 0), 0) / topThree.length
     : 0;
@@ -431,13 +445,21 @@ function scoreLocalConfidence({ retrievalResponse, currentProjectName, projectSu
   score += clamp(topScore, 0, 1) * 0.34;
   score += clamp(averageTopScore, 0, 1) * 0.22;
   score += currentProjectHit ? 0.14 : 0;
+  score += (repoSpecific && currentProjectName) ? clamp(currentProjectTopScore, 0, 1) * 0.08 : 0;
   score += reusableKnowledgeHit ? 0.07 : 0;
   score += topThree.some((result) => result.evidenceQuality === 'strong') ? 0.08 : 0;
   score += topThree.some((result) => result.supportCount >= 2) ? 0.04 : 0;
   score += Math.min(matchedTerms.length * 0.02, 0.05);
   score += projectSummary ? 0.04 : 0;
 
-  const normalizedScore = Number(clamp(score, 0, 1).toFixed(4));
+  let normalizedScore = Number(clamp(score, 0, 1).toFixed(4));
+  if (repoSpecific && currentProjectName) {
+    if (!currentProjectHit) {
+      normalizedScore = Number(Math.min(normalizedScore, 0.64).toFixed(4));
+    } else if (topCrossProjectScore > currentProjectTopScore + 0.08) {
+      normalizedScore = Number(Math.min(normalizedScore, 0.69).toFixed(4));
+    }
+  }
   const level = normalizedScore >= 0.72 ? 'high' : normalizedScore >= 0.45 ? 'medium' : 'low';
   const strongSignals = [];
   const weakSignals = [];
@@ -454,6 +476,18 @@ function scoreLocalConfidence({ retrievalResponse, currentProjectName, projectSu
   } else if (currentProjectName) {
     weakSignals.push('The current project is not strongly represented in the top local results.');
     gaps.push('Current-project evidence is weak, so any advice should be adapted carefully.');
+  }
+  if (repoSpecific && currentProjectName) {
+    if (currentProjectTopScore >= 0.58) {
+      strongSignals.push('Current-project evidence is present near the top of the local matches.');
+    }
+    if (!currentProjectHit) {
+      weakSignals.push('This repo-specific query is not anchored by current-project evidence in the top local matches.');
+      gaps.push('Treat the local answer as a cross-project analogy until the current project provides direct evidence.');
+    } else if (topCrossProjectScore > currentProjectTopScore + 0.08) {
+      weakSignals.push('Cross-project evidence currently scores higher than the best current-project match.');
+      gaps.push('Prefer the current project’s actual boundaries over stronger-looking analogies from other repos.');
+    }
   }
   if (reusableKnowledgeHit) {
     strongSignals.push('Reusable knowledge or pattern notes are present near the top of the results.');
@@ -578,8 +612,8 @@ function decideConsultationMode({ signals, localConfidence } = {}) {
   return CONSULTATION_MODES.LOCAL_ONLY;
 }
 
-function buildLocalContext({ retrievalResponse, reasoning, projectSummary, relatedPatterns } = {}) {
-  const topResults = (retrievalResponse?.results ?? []).slice(0, 4);
+function buildLocalContext({ retrievalResponse, reasoning, projectSummary, relatedPatterns, currentProjectName } = {}) {
+  const topResults = prioritizeCurrentProjectResults((retrievalResponse?.results ?? []).slice(0, 4), currentProjectName);
   const topLocalSuggestions = uniqueStrings([
     ...(projectSummary?.relevantLearnings?.solution ?? []).map((item) => `Current project solution signal: ${item}`),
     ...(projectSummary?.relevantLearnings?.reusablePattern ?? []).map((item) => `Current project reusable pattern: ${item}`),
@@ -595,7 +629,7 @@ function buildLocalContext({ retrievalResponse, reasoning, projectSummary, relat
       ...(projectSummary?.documentationPatterns ?? []),
       ...(relatedPatterns ?? []).map((pattern) => pattern.patternTitle),
     ]).slice(0, 6),
-    evidenceBasis: buildLocalEvidenceBasis({ retrievalResponse, projectSummary, relatedPatterns }),
+    evidenceBasis: buildLocalEvidenceBasis({ retrievalResponse, projectSummary, relatedPatterns, currentProjectName }),
     noteReferences: projectSummary?.noteReferences ?? {
       overview: null,
       architecture: null,
@@ -607,20 +641,35 @@ function buildLocalContext({ retrievalResponse, reasoning, projectSummary, relat
   };
 }
 
-function buildConsultationTrustSummary({ mode, signals, localConfidence, retrievalResponse, projectSummary, relatedPatterns }) {
+function buildConsultationTrustSummary({ mode, signals, localConfidence, retrievalResponse, projectSummary, relatedPatterns, currentProjectName }) {
   const topResults = (retrievalResponse?.results ?? []).slice(0, 3);
+  const currentProjectResults = currentProjectName
+    ? topResults.filter((result) => result.project === currentProjectName)
+    : [];
+  const crossProjectResults = currentProjectName
+    ? topResults.filter((result) => result.project !== currentProjectName)
+    : topResults;
   const strongestSources = uniqueStrings(topResults.flatMap((result) => (result.supportingSources ?? []).map((source) => [source.sourcePath, source.sourceSection].filter(Boolean).join(' > ')))).slice(0, 4);
-  const localEvidenceQuality = topResults.some((result) => result.evidenceQuality === 'strong')
+  const currentProjectSources = uniqueStrings(currentProjectResults.flatMap((result) => (result.supportingSources ?? []).map((source) => [source.sourcePath, source.sourceSection].filter(Boolean).join(' > ')))).slice(0, 4);
+  const crossProjectSources = uniqueStrings(crossProjectResults.flatMap((result) => (result.supportingSources ?? []).map((source) => [source.sourcePath, source.sourceSection].filter(Boolean).join(' > ')))).slice(0, 4);
+  let localEvidenceQuality = (signals?.repoSpecific && currentProjectName && currentProjectResults.length > 0 ? currentProjectResults : topResults).some((result) => result.evidenceQuality === 'strong')
     ? 'strong'
-    : (topResults.some((result) => result.evidenceQuality === 'medium') ? 'medium' : 'weak');
+    : ((signals?.repoSpecific && currentProjectName && currentProjectResults.length > 0 ? currentProjectResults : topResults).some((result) => result.evidenceQuality === 'medium') ? 'medium' : 'weak');
+  if (signals?.repoSpecific && currentProjectName && currentProjectResults.length === 0 && localEvidenceQuality === 'strong') {
+    localEvidenceQuality = 'medium';
+  }
   const strongestBasis = uniqueStrings([
-    strongestSources.length > 0 ? `Local evidence traces come from ${strongestSources.join(' | ')}.` : '',
+    currentProjectSources.length > 0 ? `Current-project evidence comes from ${currentProjectSources.join(' | ')}.` : '',
+    currentProjectSources.length === 0 && crossProjectSources.length > 0 ? `Nearest local support is cross-project evidence from ${crossProjectSources.join(' | ')}.` : '',
+    !currentProjectName && strongestSources.length > 0 ? `Local evidence traces come from ${strongestSources.join(' | ')}.` : '',
     (projectSummary?.provenance?.documentationPatterns ?? []).length > 0 ? 'Documentation guidance is backed by repo-derived documentation-pattern evidence.' : '',
     (relatedPatterns ?? []).some((pattern) => pattern.evidenceQuality === 'strong') ? 'Reusable patterns include strongly supported cross-project evidence.' : '',
   ]).slice(0, 4);
   const weakerAreas = uniqueStrings([
     localConfidence?.level === 'low' ? 'Local confidence is low, so any implementation advice should be validated against the actual code and external sources.' : '',
     topResults.some((result) => result.evidenceQuality === 'weak') ? 'Some top local matches are still heuristic or lightly supported.' : '',
+    signals?.repoSpecific && currentProjectName && currentProjectResults.length === 0 ? 'This repo-specific query is currently relying on cross-project evidence rather than direct current-project support.' : '',
+    signals?.repoSpecific && currentProjectName && currentProjectResults.length > 0 && crossProjectResults[0] && Number(crossProjectResults[0].relevanceScore ?? 0) > Number(currentProjectResults[0]?.relevanceScore ?? 0) + 0.08 ? 'Cross-project analogs currently score higher than the best current-project evidence.' : '',
     mode !== CONSULTATION_MODES.LOCAL_ONLY && signals?.repoSpecific ? 'The task is repo-shaped, but external guidance was still needed because local trust signals were not sufficient on their own.' : '',
   ]).slice(0, 4);
 
@@ -635,9 +684,18 @@ function buildConsultationTrustSummary({ mode, signals, localConfidence, retriev
   };
 }
 
-function buildLocalEvidenceBasis({ retrievalResponse, projectSummary, relatedPatterns }) {
-  const topResults = (retrievalResponse?.results ?? []).slice(0, 3);
+function buildLocalEvidenceBasis({ retrievalResponse, projectSummary, relatedPatterns, currentProjectName }) {
+  const topResults = prioritizeCurrentProjectResults((retrievalResponse?.results ?? []).slice(0, 3), currentProjectName);
+  const currentProjectResults = currentProjectName
+    ? topResults.filter((result) => result.project === currentProjectName)
+    : [];
+  const crossProjectResults = currentProjectName
+    ? topResults.filter((result) => result.project !== currentProjectName)
+    : [];
   return uniqueStrings([
+    currentProjectName && currentProjectResults.length === 0 && crossProjectResults.length > 0
+      ? `No strong current-project evidence was found; nearest cross-project support is ${crossProjectResults.map((result) => `${result.project}/${result.noteType}`).join(' | ')}.`
+      : '',
     ...topResults.map((result) => {
       const firstSource = result.supportingSources?.[0];
       if (!firstSource) {
@@ -648,6 +706,13 @@ function buildLocalEvidenceBasis({ retrievalResponse, projectSummary, relatedPat
     ...(projectSummary?.provenance?.boundaries ?? []).slice(0, 2).map((item) => `Boundary evidence: ${item.value}`),
     ...(relatedPatterns ?? []).slice(0, 2).map((pattern) => `Reusable pattern evidence: ${pattern.patternTitle} (${pattern.evidenceQuality})`),
   ]).slice(0, 6);
+}
+
+function prioritizeCurrentProjectResults(results, currentProjectName) {
+  if (!currentProjectName) {
+    return results;
+  }
+  return [...results].sort((left, right) => Number(right.project === currentProjectName) - Number(left.project === currentProjectName));
 }
 
 function buildExternalGuidanceReason(signals, localConfidence) {
@@ -752,8 +817,10 @@ function buildConsultationMemoryGuidance({ mode, signals, localConfidence, local
 
 function buildDecisionRationale({ mode, signals, localConfidence } = {}) {
   const reasons = [];
-  if (mode === CONSULTATION_MODES.LOCAL_ONLY) {
+  if (mode === CONSULTATION_MODES.LOCAL_ONLY && localConfidence?.level === 'high') {
     reasons.push('Local confidence is high enough that repo memory should lead the implementation.');
+  } else if (mode === CONSULTATION_MODES.LOCAL_ONLY) {
+    reasons.push('Local confidence is sufficient to start from repo memory without immediate web escalation.');
   }
   if (signals?.repoSpecific && localConfidence?.level !== 'low' && !signals?.currentGuidance && !signals?.versionSpecific && !signals?.migration) {
     reasons.push('The question is repo-specific and local recall is strong enough to avoid unnecessary web escalation.');

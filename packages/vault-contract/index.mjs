@@ -107,6 +107,11 @@ export async function cleanupDeprecatedVaultArtifacts(vaultRoot, projectNames = 
     const deprecatedPaths = buildDeprecatedProjectPaths(vaultRoot, projectName);
     for (const targetPath of Object.values(deprecatedPaths)) {
       try {
+        await fs.stat(targetPath);
+      } catch {
+        continue;
+      }
+      try {
         await fs.rm(targetPath, { force: true });
         removedPaths.push(targetPath);
       } catch {
@@ -116,6 +121,11 @@ export async function cleanupDeprecatedVaultArtifacts(vaultRoot, projectNames = 
   }
 
   for (const targetPath of await findRuntimeArtifactsInVault(vaultRoot)) {
+    try {
+      await fs.stat(targetPath);
+    } catch {
+      continue;
+    }
     try {
       await fs.rm(targetPath, { recursive: true, force: true });
       removedPaths.push(targetPath);

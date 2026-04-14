@@ -1,5 +1,6 @@
 export {
   bootstrapVault,
+  readGlobalKnowledgeNoteContents,
   readProjectNoteContents,
   syncNotes,
   writeManagedKnowledgeNotes,

@@ -55,7 +55,7 @@ const RESEARCH_CANDIDATES_TEMPLATE = [
   '- Use research candidates to prevent the vault from turning into a web clipping dump.',
 ].join('\n');
 
-export async function searchBrain({ query, currentProjectPath, currentProjectName, topK = 6, runtimeOptions } = {}) {
+export async function searchBrain({ query, currentProjectPath, currentProjectName, topK = 6, runtimeOptions, recordUsage = true } = {}) {
   const {
     readyRuntime,
     resolvedProject,
@@ -73,20 +73,22 @@ export async function searchBrain({ query, currentProjectPath, currentProjectNam
     recentLearningsLimit: 4,
   });
 
-  recordQuery(readyRuntime.state, {
-    at: timestamp(),
-    query: String(query ?? '').trim(),
-    mode: reasoning.mode,
-    relatedProjects: reasoning.relatedProjects,
-    topResultIds: retrievalResponse.results.slice(0, 5).map((result) => `${result.project}:${result.noteType}:${result.sourcePath}`),
-  });
-  recordOperation(readyRuntime.state, 'query', {
-    projects: reasoning.relatedProjects,
-    summary: `MCP query '${String(query ?? '').trim()}' matched ${reasoning.relatedProjects.join(', ') || 'no projects'}`,
-  });
-  await saveState(readyRuntime.config, readyRuntime.state);
-  readyRuntime.state = await loadState(readyRuntime.config);
-  await refreshQueryHistoryNote(readyRuntime.config, readyRuntime.state);
+  if (recordUsage) {
+    recordQuery(readyRuntime.state, {
+      at: timestamp(),
+      query: String(query ?? '').trim(),
+      mode: reasoning.mode,
+      relatedProjects: reasoning.relatedProjects,
+      topResultIds: retrievalResponse.results.slice(0, 5).map((result) => `${result.project}:${result.noteType}:${result.sourcePath}`),
+    });
+    recordOperation(readyRuntime.state, 'query', {
+      projects: reasoning.relatedProjects,
+      summary: `MCP query '${String(query ?? '').trim()}' matched ${reasoning.relatedProjects.join(', ') || 'no projects'}`,
+    });
+    await saveState(readyRuntime.config, readyRuntime.state);
+    readyRuntime.state = await loadState(readyRuntime.config);
+    await refreshQueryHistoryNote(readyRuntime.config, readyRuntime.state);
+  }
 
   await appendLog(buildLogPath(readyRuntime.config, 'brain-mcp.log'), `brain.search | query=${JSON.stringify(query)} | project=${resolvedProject?.name ?? 'global'}`);
 
@@ -125,7 +127,7 @@ export async function searchBrain({ query, currentProjectPath, currentProjectNam
   };
 }
 
-export async function consultBrain({ query, currentProjectPath, currentProjectName, topK = 6, runtimeOptions } = {}) {
+export async function consultBrain({ query, currentProjectPath, currentProjectName, topK = 6, runtimeOptions, recordUsage = true } = {}) {
   const {
     readyRuntime,
     resolvedProject,
@@ -155,22 +157,24 @@ export async function consultBrain({ query, currentProjectPath, currentProjectNa
     recentLearnings,
   });
 
-  recordQuery(readyRuntime.state, {
-    at: timestamp(),
-    query: String(query ?? '').trim(),
-    mode: payload.mode,
-    relatedProjects: payload.localContext.relatedProjects,
-    topResultIds: retrievalResponse.results.slice(0, 5).map((result) => `${result.project}:${result.noteType}:${result.sourcePath}`),
-    webResearchRecommended: payload.researchDecision.needsWebResearch,
-    localConfidence: payload.localConfidence.score,
-  });
-  recordOperation(readyRuntime.state, 'consult', {
-    projects: payload.localContext.relatedProjects,
-    summary: `Consult '${String(query ?? '').trim()}' -> ${payload.mode}`,
-  });
-  await saveState(readyRuntime.config, readyRuntime.state);
-  readyRuntime.state = await loadState(readyRuntime.config);
-  await refreshQueryHistoryNote(readyRuntime.config, readyRuntime.state);
+  if (recordUsage) {
+    recordQuery(readyRuntime.state, {
+      at: timestamp(),
+      query: String(query ?? '').trim(),
+      mode: payload.mode,
+      relatedProjects: payload.localContext.relatedProjects,
+      topResultIds: retrievalResponse.results.slice(0, 5).map((result) => `${result.project}:${result.noteType}:${result.sourcePath}`),
+      webResearchRecommended: payload.researchDecision.needsWebResearch,
+      localConfidence: payload.localConfidence.score,
+    });
+    recordOperation(readyRuntime.state, 'consult', {
+      projects: payload.localContext.relatedProjects,
+      summary: `Consult '${String(query ?? '').trim()}' -> ${payload.mode}`,
+    });
+    await saveState(readyRuntime.config, readyRuntime.state);
+    readyRuntime.state = await loadState(readyRuntime.config);
+    await refreshQueryHistoryNote(readyRuntime.config, readyRuntime.state);
+  }
 
   await appendLog(buildLogPath(readyRuntime.config, 'brain-mcp.log'), `brain.consult | query=${JSON.stringify(query)} | project=${resolvedProject?.name ?? 'global'} | mode=${payload.mode}`);
   return payload;
@@ -410,6 +414,7 @@ async function loadBrainRuntime(runtimeOptions = {}) {
     config,
     state,
     snapshots,
+    runtimeOptions,
   };
 }
 
@@ -418,11 +423,12 @@ async function ensureKnowledgeReady(runtime, { skipEmbed = false } = {}) {
     return runtime;
   }
 
-  await runSync({});
+  const workerModule = await import('../../apps/worker/index.mjs');
+  await workerModule.runSync(runtime.runtimeOptions ?? {});
   if (!skipEmbed) {
-    await runEmbed({});
+    await workerModule.runEmbed(runtime.runtimeOptions ?? {});
   }
-  return loadBrainRuntime();
+  return loadBrainRuntime(runtime.runtimeOptions ?? {});
 }
 
 async function resolveProjectContext(runtime, { projectPath, projectName } = {}) {

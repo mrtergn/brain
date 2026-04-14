@@ -5,7 +5,13 @@ import { promisify } from 'node:util';
 import { LocalSemanticEmbedder, summarizeEmbeddingBatch } from '../../packages/embeddings/index.mjs';
 import { consultBrain, searchBrain } from '../../packages/brain-service/index.mjs';
 import { ChromaVectorStore } from '../../packages/vector-store/index.mjs';
-import { bootstrapVault, readProjectNoteContents, syncNotes, writeManagedKnowledgeNotes } from '../../packages/obsidian-writer/index.mjs';
+import {
+  bootstrapVault,
+  readGlobalKnowledgeNoteContents,
+  readProjectNoteContents,
+  syncNotes,
+  writeManagedKnowledgeNotes,
+} from '../../packages/obsidian-writer/index.mjs';
 import { reasonAboutQuery } from '../../packages/reasoner/index.mjs';
 import { retrieveContext } from '../../packages/retriever/index.mjs';
 import { scanWorkspace } from '../../packages/scanner/index.mjs';
@@ -23,13 +29,20 @@ import {
   saveState,
   setProjectState,
 } from '../../packages/state-manager/index.mjs';
-import { buildProjectKnowledgeSources, chunkProjectKnowledge } from '../../packages/chunker/index.mjs';
+import {
+  buildGlobalKnowledgeSources,
+  buildProjectKnowledgeSources,
+  chunkProjectKnowledge,
+  GLOBAL_KNOWLEDGE_CACHE_KEY,
+  GLOBAL_KNOWLEDGE_PROJECT_NAME,
+} from '../../packages/chunker/index.mjs';
 import {
   appendLog,
   buildLogPath,
   buildRuntimeConfig,
   createOperationSummary,
   extractProjectNames,
+  sha256,
   timestamp,
 } from '../../packages/shared/index.mjs';
 import { isCanonicalKnowledgeBasePath, renderVaultValidationReport, validateVaultContract } from '../../packages/vault-contract/index.mjs';
@@ -93,10 +106,12 @@ export async function runScan(options = {}) {
 
 export async function runSync(options = {}) {
   const { config, state, scanResult, changedProjects } = await runScan(options);
+  const knowledgeProjects = await loadManagedKnowledgeProjects(config, state, scanResult.projects);
   const syncSummary = await syncNotes(config, state, scanResult.projects, {
     changedProjects,
     trigger: options.trigger ?? 'sync',
     failures: scanResult.failures,
+    knowledgeProjects,
   });
 
   for (const project of scanResult.projects) {
@@ -192,8 +207,10 @@ export async function runEmbed(options = {}) {
     summary: createOperationSummary(embeddedProjects.map((project) => project.name), 'embedded project'),
   });
   await saveState(config, state);
-  await writeManagedKnowledgeNotes(config, state, projects);
-  await appendLog(buildLogPath(config), `embed completed for ${embeddedProjects.length} project(s)`);
+  const knowledgeProjects = await loadManagedKnowledgeProjects(config, state, projects);
+  await writeManagedKnowledgeNotes(config, state, knowledgeProjects);
+  const globalKnowledgeEmbedding = await syncGlobalKnowledgeEmbeddings(config, embedder, vectorStore);
+  await appendLog(buildLogPath(config), `embed completed for ${embeddedProjects.length} project(s); global knowledge chunks=${globalKnowledgeEmbedding.chunkCount}`);
   return { config, state, embeddedProjects };
 }
 
@@ -202,7 +219,8 @@ export async function runLearn(options = {}) {
   const state = await loadState(config);
   const projectNames = options.projectNames ?? extractProjectNames(options);
   const projects = await listCachedProjectSnapshots(config, projectNames.length > 0 ? projectNames : Object.keys(state.projects));
-  await writeManagedKnowledgeNotes(config, state, projects);
+  const knowledgeProjects = await loadManagedKnowledgeProjects(config, state, projects);
+  await writeManagedKnowledgeNotes(config, state, knowledgeProjects);
   state.lastLearnAt = timestamp();
   recordOperation(state, 'learn', {
     projects: projects.map((project) => project.name),
@@ -243,8 +261,8 @@ export async function runQuery(options = {}) {
     summary: `Query '${queryText}' matched ${reasoning.relatedProjects.join(', ') || 'no projects'}`,
   });
   await saveState(config, state);
-  const projects = await listCachedProjectSnapshots(config, Object.keys(state.projects));
-  await writeManagedKnowledgeNotes(config, state, projects);
+  const knowledgeProjects = await loadManagedKnowledgeProjects(config, state);
+  await writeManagedKnowledgeNotes(config, state, knowledgeProjects);
   await appendLog(buildLogPath(config), `query completed: ${queryText}`);
   return {
     config,
@@ -350,6 +368,18 @@ export async function runDoctor(options = {}) {
     warnings.push('No indexed projects exist yet. Run brain:sync and brain:embed before trusting retrieval.');
   }
 
+  const globalKnowledgeChunks = await loadProjectChunks(config, GLOBAL_KNOWLEDGE_CACHE_KEY);
+  if ((state.lastEmbedAt ?? null) !== null) {
+    if (globalKnowledgeChunks.length === 0) {
+      issues.push('Global knowledge-base notes are not embedded. Run brain:embed to index reusable-patterns and documentation-style-patterns.');
+    } else {
+      const invalidKnowledgeChunk = globalKnowledgeChunks.find((chunk) => chunk.noteType !== 'knowledge' || !isCanonicalKnowledgeBasePath(String(chunk.sourcePath ?? '')));
+      if (invalidKnowledgeChunk) {
+        issues.push(`Global knowledge chunk cache contains a non-canonical entry: ${invalidKnowledgeChunk.sourcePath}`);
+      }
+    }
+  }
+
   let queryCheck = null;
   let consultCheck = null;
   const smokeProjectName = state.projects?.brain ? 'brain' : (projectNames[0] ?? null);
@@ -362,6 +392,7 @@ export async function runDoctor(options = {}) {
       currentProjectName: smokeProjectName,
       topK: 5,
       runtimeOptions: options,
+      recordUsage: false,
     });
     if (queryCheck.results.length === 0) {
       issues.push('Query smoke test returned no results.');
@@ -390,6 +421,7 @@ export async function runDoctor(options = {}) {
       currentProjectName: smokeProjectName,
       topK: 5,
       runtimeOptions: options,
+      recordUsage: false,
     });
     if (!['local-only', 'local-plus-web-assist', 'web-first-local-adaptation'].includes(consultCheck.mode)) {
       issues.push(`Consult smoke test returned an invalid mode: ${consultCheck.mode}`);
@@ -477,4 +509,51 @@ export async function runWatch(options = {}) {
     await runEmbed({ ...options, projectNames });
     await runLearn({ ...options, projectNames });
   });
+}
+
+async function loadManagedKnowledgeProjects(config, state, preferredProjects = []) {
+  const cachedProjects = await listCachedProjectSnapshots(config, Object.keys(state.projects ?? {}));
+  const projectsByName = new Map(cachedProjects.map((project) => [project.name, project]));
+  for (const project of preferredProjects.filter(Boolean)) {
+    projectsByName.set(project.name, project);
+  }
+  return [...projectsByName.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function syncGlobalKnowledgeEmbeddings(config, embedder, vectorStore) {
+  const noteContents = await readGlobalKnowledgeNoteContents(config);
+  const sources = buildGlobalKnowledgeSources(noteContents);
+  const previousChunks = await loadProjectChunks(config, GLOBAL_KNOWLEDGE_CACHE_KEY);
+  const previousIds = new Set(previousChunks.map((chunk) => chunk.id));
+
+  if (sources.length === 0) {
+    if (previousIds.size > 0) {
+      await vectorStore.deleteIds([...previousIds]);
+      await cacheProjectChunks(config, GLOBAL_KNOWLEDGE_CACHE_KEY, []);
+    }
+    return { chunkCount: 0 };
+  }
+
+  const fingerprint = sha256(Object.values(noteContents)
+    .filter(Boolean)
+    .map((payload) => `${payload.sourcePath}:${payload.text}`)
+    .join('\n\n'));
+  const knowledgeProject = {
+    name: GLOBAL_KNOWLEDGE_PROJECT_NAME,
+    fingerprint,
+    normalizedAt: timestamp(),
+    rootPath: config.vaultRoot,
+    tags: ['knowledge', 'global'],
+  };
+  const chunks = chunkProjectKnowledge(knowledgeProject, sources);
+  const nextIds = new Set(chunks.map((chunk) => chunk.id));
+  const deletedIds = [...previousIds].filter((id) => !nextIds.has(id));
+  if (deletedIds.length > 0) {
+    await vectorStore.deleteIds(deletedIds);
+  }
+
+  const embeddings = await embedder.embedTexts(chunks.map((chunk) => chunk.content));
+  await vectorStore.upsert(chunks, embeddings);
+  await cacheProjectChunks(config, GLOBAL_KNOWLEDGE_CACHE_KEY, chunks);
+  return { chunkCount: chunks.length };
 }

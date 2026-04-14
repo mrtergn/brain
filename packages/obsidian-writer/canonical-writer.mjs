@@ -101,7 +101,7 @@ export async function bootstrapVault(config) {
   await createLocalRunner(config);
 }
 
-export async function syncNotes(config, state, projects, { changedProjects = [], trigger = 'sync', failures = [] } = {}) {
+export async function syncNotes(config, state, projects, { changedProjects = [], trigger = 'sync', failures = [], knowledgeProjects = projects } = {}) {
   await bootstrapVault(config);
   const syncedAt = timestamp();
   const removedPaths = await cleanupDeprecatedVaultArtifacts(config.vaultRoot, projects.map((project) => project.name));
@@ -110,7 +110,7 @@ export async function syncNotes(config, state, projects, { changedProjects = [],
     await ensureProjectFolderCanonical(config, project);
   }
 
-  await writeManagedKnowledgeNotes(config, state, projects);
+  await writeManagedKnowledgeNotes(config, state, knowledgeProjects);
 
   return {
     date: syncedAt.slice(0, 10),
@@ -130,6 +130,19 @@ export async function readProjectNoteContents(config, project) {
   const entries = await Promise.all(Object.entries(notePaths).map(async ([noteType, filePath]) => {
     const text = await readText(filePath, '');
     return [noteType, text ? { text, sourcePath: filePath, tags: [...(project.tags ?? []), noteType] } : null];
+  }));
+  return Object.fromEntries(entries);
+}
+
+export async function readGlobalKnowledgeNoteContents(config) {
+  const globalPaths = buildGlobalNotePaths(config.vaultRoot);
+  const noteDefinitions = [
+    ['reusablePatterns', globalPaths.reusablePatterns, ['knowledge', 'reusable-patterns']],
+    ['documentationStylePatterns', globalPaths.documentationStylePatterns, ['knowledge', 'documentation-style-patterns']],
+  ];
+  const entries = await Promise.all(noteDefinitions.map(async ([key, filePath, tags]) => {
+    const text = await readText(filePath, '');
+    return [key, text ? { text, sourcePath: filePath, tags } : null];
   }));
   return Object.fromEntries(entries);
 }

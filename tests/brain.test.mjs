@@ -4,15 +4,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 
+import { searchBrain } from '../packages/brain-service/index.mjs';
 import { buildResearchConsultation, synthesizeLocalAndExternalGuidance } from '../packages/research/index.mjs';
 import { BRAIN_MCP_TOOL_NAMES } from '../apps/mcp-server/index.mjs';
-import { buildProjectKnowledgeSources, chunkProjectKnowledge } from '../packages/chunker/index.mjs';
+import { runDoctor } from '../apps/worker/index.mjs';
+import { buildProjectKnowledgeSources, chunkProjectKnowledge, GLOBAL_KNOWLEDGE_CACHE_KEY } from '../packages/chunker/index.mjs';
 import { LocalSemanticEmbedder, shutdownEmbeddingService } from '../packages/embeddings/index.mjs';
 import { normalizeProject } from '../packages/normalizer/index.mjs';
-import { writeQueryHistoryNote } from '../packages/obsidian-writer/index.mjs';
+import { syncNotes, writeQueryHistoryNote } from '../packages/obsidian-writer/index.mjs';
 import { expandQueryText } from '../packages/retriever/index.mjs';
-import { normalizeState } from '../packages/state-manager/index.mjs';
-import { validateVaultContract } from '../packages/vault-contract/index.mjs';
+import { buildRuntimeConfig } from '../packages/shared/index.mjs';
+import { loadState, normalizeState } from '../packages/state-manager/index.mjs';
+import { cleanupDeprecatedVaultArtifacts, validateVaultContract } from '../packages/vault-contract/index.mjs';
 import { analyzeProject } from '../scripts/ai-brain/lib/project-analysis.mjs';
 
 const TEMP_PATHS = [];
@@ -276,6 +279,44 @@ test('chunker emits provenance-aware metadata for normalized project chunks', as
   assert.ok(chunks[0].metadata.supportingSources.includes('sourcePath'));
 });
 
+test('searchBrain bootstraps a cold runtime and embeds global knowledge notes', async () => {
+  const fixture = await createRuntimeFixture('brain-search-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+
+  const payload = await searchBrain({
+    query: 'read-only inputs',
+    currentProjectName: 'sample',
+    runtimeOptions: fixture.runtimeOptions,
+  });
+
+  assert.ok(Array.isArray(payload.results));
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+  const state = await loadState(config);
+  assert.ok(state.lastEmbedAt);
+
+  const knowledgeChunkPath = path.join(config.chunkCacheRoot, `${GLOBAL_KNOWLEDGE_CACHE_KEY}.json`);
+  const knowledgeChunks = JSON.parse(await readFile(knowledgeChunkPath, 'utf8'));
+  assert.ok(knowledgeChunks.some((chunk) => /reusable-patterns\.md$/i.test(chunk.sourcePath)));
+  assert.ok(knowledgeChunks.some((chunk) => /documentation-style-patterns\.md$/i.test(chunk.sourcePath)));
+});
+
+test('syncNotes keeps global summaries based on the full knowledge project set during scoped sync', async () => {
+  const fixture = await createRuntimeFixture('brain-sync-scope-');
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+  const state = normalizeState(config, {});
+  const alpha = createProjectStub('alpha');
+  const beta = createProjectStub('beta');
+
+  await syncNotes(config, state, [alpha], {
+    changedProjects: ['alpha'],
+    knowledgeProjects: [alpha, beta],
+  });
+
+  const projectIndex = await readFile(path.join(config.vaultRoot, '01_Projects', '_Project_Index.md'), 'utf8');
+  assert.ok(projectIndex.includes('alpha'));
+  assert.ok(projectIndex.includes('beta'));
+});
+
 test('research consultation escalates token refresh best-practice queries to web-first mode', () => {
   const consultation = buildResearchConsultation({
     query: 'best practice for token refresh handling',
@@ -433,6 +474,97 @@ test('research consultation stays local-only for medium-confidence repo-specific
 
   assert.equal(consultation.mode, 'local-only');
   assert.equal(consultation.researchDecision.needsWebResearch, false);
+});
+
+test('repo-specific consultation lowers confidence when cross-project evidence outranks current-project evidence', () => {
+  const consultation = buildResearchConsultation({
+    query: 'safe place in this repo to change retry logic without breaking the shared client boundary',
+    currentProjectName: 'brain',
+    currentProjectPath: '/tmp/brain',
+    retrievalResponse: {
+      results: [
+        {
+          project: 'other-repo',
+          noteType: 'learnings',
+          sourcePath: '/tmp/other-repo/learnings.md',
+          sourceKind: 'note',
+          relevanceScore: 0.91,
+          whyMatched: 'cross-project retry pattern',
+          whyTrusted: 'source is a structured learning note; evidence quality: strong; confidence: 0.90',
+          snippet: 'Place retry behavior in a shared outbound client wrapper.',
+          matchedTerms: ['retry', 'shared', 'boundary'],
+          evidenceQuality: 'strong',
+          confidence: 0.9,
+          supportCount: 2,
+          supportingSources: [
+            {
+              sourcePath: 'other/README.md',
+              sourceKind: 'readme',
+              sourceSection: 'Boundaries',
+              excerpt: 'Place retry behavior in a shared outbound client wrapper.',
+            },
+          ],
+        },
+        {
+          project: 'brain',
+          noteType: 'learnings',
+          sourcePath: '/tmp/brain/learnings.md',
+          sourceKind: 'note',
+          relevanceScore: 0.73,
+          whyMatched: 'current project retry boundary',
+          whyTrusted: 'source is a structured learning note; evidence quality: strong; confidence: 0.82',
+          snippet: 'Place retry behavior at the shared client boundary instead of scattering retries across callers.',
+          matchedTerms: ['retry', 'shared', 'client', 'boundary'],
+          evidenceQuality: 'strong',
+          confidence: 0.82,
+          supportCount: 1,
+          supportingSources: [
+            {
+              sourcePath: 'brain/README.md',
+              sourceKind: 'readme',
+              sourceSection: 'Boundaries',
+              excerpt: 'Place retry behavior at the shared client boundary instead of scattering retries across callers.',
+            },
+          ],
+        },
+      ],
+    },
+    reasoning: {
+      relatedProjects: ['other-repo', 'brain'],
+      improvementRecommendations: [],
+    },
+    projectSummary: {
+      relevantLearnings: {
+        solution: ['Place retry behavior at the shared client boundary instead of scattering retries across callers.'],
+        reusablePattern: ['Central retry wrapper for outbound API clients'],
+        whyItWorked: ['Shared wrappers keep retry behavior consistent.'],
+      },
+      projectPatterns: ['Central retry wrapper for outbound API clients'],
+      documentationPatterns: [],
+      provenance: {
+        purpose: null,
+        boundaries: [],
+        validationSurfaces: [],
+        reusableSolutions: [],
+        documentationPatterns: [],
+      },
+      noteReferences: {
+        overview: '/tmp/brain/overview.md',
+        architecture: '/tmp/brain/architecture.md',
+        learnings: '/tmp/brain/learnings.md',
+        prompts: '/tmp/brain/prompts.md',
+        knowledge: '/tmp/brain/reusable-patterns.md',
+        documentationStyle: '/tmp/brain/documentation-style-patterns.md',
+      },
+      stack: ['JavaScript', 'Node.js'],
+    },
+    relatedPatterns: [],
+    recentLearnings: [],
+  });
+
+  assert.equal(consultation.localConfidence.level, 'medium');
+  assert.ok(consultation.trustSummary.strongestBasis.some((item) => item.includes('Current-project evidence')));
+  assert.ok(consultation.trustSummary.weakerAreas.some((item) => /cross-project/i.test(item)));
 });
 
 test('research consultation reuses documentation-style patterns for repo-facing doc tasks', () => {
@@ -724,6 +856,25 @@ test('query history rewrite preserves curated sections while removing generated 
   assert.ok(!updated.includes('<!-- BRAIN:GENERATED_START -->'));
 });
 
+test('runDoctor does not add query history entries during smoke checks', async () => {
+  const fixture = await createRuntimeFixture('brain-doctor-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+
+  await searchBrain({
+    query: 'read-only inputs',
+    currentProjectName: 'sample',
+    runtimeOptions: fixture.runtimeOptions,
+  });
+
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+  const before = await loadState(config);
+  await runDoctor(fixture.runtimeOptions);
+  const afterState = await loadState(config);
+
+  assert.equal(afterState.queryHistory.length, before.queryHistory.length);
+  assert.deepEqual(afterState.queryHistory.map((entry) => entry.query), before.queryHistory.map((entry) => entry.query));
+});
+
 test('vault validation flags deprecated project mirrors and legacy markers', async () => {
   const vaultRoot = await mkdtemp(path.join(os.tmpdir(), 'brain-vault-'));
   TEMP_PATHS.push(vaultRoot);
@@ -787,6 +938,19 @@ test('state normalization removes legacy query references to deprecated vault su
   ]);
 });
 
+test('cleanupDeprecatedVaultArtifacts only reports paths that actually existed', async () => {
+  const vaultRoot = await mkdtemp(path.join(os.tmpdir(), 'brain-cleanup-'));
+  TEMP_PATHS.push(vaultRoot);
+  await mkdir(path.join(vaultRoot, '01_Projects', 'demo'), { recursive: true });
+  await mkdir(path.join(vaultRoot, '04_Knowledge_Base'), { recursive: true });
+  const logsPath = path.join(vaultRoot, '01_Projects', 'demo', 'logs.md');
+  await writeFile(logsPath, '# demo Logs\n', 'utf8');
+
+  const removed = await cleanupDeprecatedVaultArtifacts(vaultRoot, ['demo']);
+
+  assert.deepEqual(removed, [logsPath]);
+});
+
 test('MCP tool contract stays stable for Copilot integration', () => {
   assert.deepEqual(BRAIN_MCP_TOOL_NAMES, [
     'brain.search',
@@ -799,3 +963,119 @@ test('MCP tool contract stays stable for Copilot integration', () => {
     'brain.capture_research_candidate',
   ]);
 });
+
+async function createRuntimeFixture(prefix) {
+  const root = await mkdtemp(path.join(os.tmpdir(), prefix));
+  TEMP_PATHS.push(root);
+  const projectsRoot = path.join(root, 'projects');
+  const vaultRoot = path.join(root, 'vault');
+  const dataRoot = path.join(root, 'data');
+  await mkdir(projectsRoot, { recursive: true });
+  await mkdir(vaultRoot, { recursive: true });
+  await mkdir(dataRoot, { recursive: true });
+  return {
+    root,
+    projectsRoot,
+    vaultRoot,
+    dataRoot,
+    runtimeOptions: {
+      projectsRoot,
+      vaultRoot,
+      dataRoot,
+      projectNames: ['sample'],
+    },
+  };
+}
+
+async function createSampleProject(projectRoot) {
+  await mkdir(projectRoot, { recursive: true });
+  await writeFile(path.join(projectRoot, 'README.md'), [
+    '# Sample Project',
+    '',
+    '- Source repositories are read-only inputs.',
+    '- Keep runtime state under data/ instead of the knowledge vault.',
+    '',
+    '```bash',
+    'npm run doctor',
+    'npm run validate:vault',
+    '```',
+  ].join('\n'), 'utf8');
+  await writeFile(path.join(projectRoot, 'package.json'), JSON.stringify({
+    name: 'sample',
+    private: true,
+    scripts: {
+      doctor: 'node doctor.mjs',
+      test: 'node --test',
+      'validate:vault': 'node validate.mjs',
+    },
+  }, null, 2), 'utf8');
+}
+
+function createProjectStub(name) {
+  return {
+    id: `${name}-id`,
+    slug: name,
+    name,
+    rootPath: `/tmp/${name}`,
+    evidenceModelVersion: 'provenance-v1',
+    fingerprint: `${name}-fingerprint`,
+    parsedAt: '2026-04-12T00:00:00.000Z',
+    normalizedAt: '2026-04-12T00:00:00.000Z',
+    purpose: `${name} purpose`,
+    summary: `${name} summary`,
+    stack: ['JavaScript', 'Node.js'],
+    languages: ['JavaScript'],
+    architecture: ['Monorepo with separate app and package boundaries'],
+    modules: ['apps', 'packages'],
+    workflows: ['Automation-first workflow with scriptable local entrypoints.'],
+    integrationSurfaces: ['Code entry surface: apps/cli/index.mjs'],
+    boundaryRules: ['Source repositories are read-only inputs.'],
+    validationSurfaces: ['Package script: doctor: node doctor.mjs'],
+    recurringProblems: ['Repository memory should stay trustworthy instead of drifting into stale notes.'],
+    reusableSolutions: ['Use modular folders and shared packages to separate reusable capabilities from product surfaces.'],
+    documentationPatterns: ['Documentation layout pattern: keep the README as the public cover, then split architecture, operator, CLI, or troubleshooting guidance into focused docs.'],
+    documentationQualitySignals: ['README exposes anchor navigation so the landing page stays fast to scan on GitHub.'],
+    documentationQualityScore: 7,
+    riskNotes: [],
+    improvementIdeas: [],
+    promptAnchors: [],
+    documentationPaths: ['README.md', 'docs/ARCHITECTURE.md'],
+    entryPoints: ['apps/cli/index.mjs'],
+    sourceStats: {
+      totalFilesScanned: 12,
+      totalDirectoriesScanned: 4,
+      codeFilesDetected: 6,
+    },
+    warnings: [],
+    tags: ['project', 'documentation'],
+    provenance: {
+      purpose: null,
+      architecture: [],
+      modules: [],
+      workflows: [],
+      integrationSurfaces: [],
+      boundaryRules: [],
+      validationSurfaces: [],
+      recurringProblems: [],
+      reusableSolutions: [],
+      documentationPatterns: [],
+      documentationQualitySignals: [],
+    },
+    corpusText: `${name} corpus`,
+    promptTemplateContext: {
+      project: name,
+      stack: ['JavaScript', 'Node.js'],
+      architecture: ['Monorepo with separate app and package boundaries'],
+      keyModules: ['apps', 'packages'],
+    },
+    noteTargets: {
+      overview: `01_Projects/${name}/overview.md`,
+      architecture: `01_Projects/${name}/architecture.md`,
+      learnings: `01_Projects/${name}/learnings.md`,
+      prompts: `01_Projects/${name}/prompts.md`,
+      knowledge: '04_Knowledge_Base/reusable-patterns.md',
+      documentationStyle: '04_Knowledge_Base/documentation-style-patterns.md',
+    },
+    analysis: {},
+  };
+}

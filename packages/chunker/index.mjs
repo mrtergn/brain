@@ -12,6 +12,9 @@ import { sha256, truncate } from '../shared/index.mjs';
 const DEFAULT_MAX_CHARS = 1100;
 const DEFAULT_OVERLAP_CHARS = 140;
 
+export const GLOBAL_KNOWLEDGE_PROJECT_NAME = 'global-knowledge';
+export const GLOBAL_KNOWLEDGE_CACHE_KEY = '__global_knowledge__';
+
 export function buildProjectKnowledgeSources(project, noteContents = {}) {
   const sources = [
     {
@@ -43,6 +46,27 @@ export function buildProjectKnowledgeSources(project, noteContents = {}) {
     });
   }
 
+  return sources;
+}
+
+export function buildGlobalKnowledgeSources(noteContents = {}) {
+  const sources = [];
+  for (const [key, payload] of Object.entries(noteContents)) {
+    if (!payload?.text) {
+      continue;
+    }
+    const sourceAssessment = assessNoteSource({ noteType: 'knowledge', sourcePath: payload.sourcePath, text: payload.text });
+    sources.push({
+      noteType: 'knowledge',
+      sourcePath: payload.sourcePath,
+      sourceKind: sourceAssessment.sourceKind,
+      knowledgeType: sourceAssessment.knowledgeType,
+      knowledgeStrength: sourceAssessment.knowledgeStrength,
+      provenanceItems: sourceAssessment.provenanceItems,
+      tags: payload.tags ?? ['knowledge', key],
+      text: payload.text,
+    });
+  }
   return sources;
 }
 
@@ -103,6 +127,25 @@ function assessNoteSource({ noteType, sourcePath, text }) {
     sourceSection: firstHeading,
     excerpt: extractEvidenceExcerpt(text),
   });
+
+  if (noteType === 'knowledge') {
+    const documentationCatalog = /documentation-style-patterns/i.test(String(sourcePath ?? ''));
+    return {
+      sourceKind: 'note',
+      knowledgeType: documentationCatalog ? 'documentation-pattern-catalog' : 'pattern-catalog',
+      knowledgeStrength: 'strong',
+      provenanceItems: [createEvidenceItem({
+        category: 'knowledge',
+        value: documentationCatalog
+          ? 'Documentation-style pattern catalog distilled from cross-project repo-facing evidence.'
+          : 'Reusable engineering pattern catalog distilled from cross-project project memory.',
+        sources: [selfSource],
+        derivedFrom: 'cross-project-aggregation',
+        evidenceQuality: 'strong',
+        confidence: 0.84,
+      })].filter(Boolean),
+    };
+  }
 
   if (noteType === 'learnings') {
     const structured = /\*\*Problem\*\*[\s\S]*?\*\*Solution\*\*[\s\S]*?\*\*Reusable Pattern\*\*/i.test(text);
