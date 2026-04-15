@@ -71,6 +71,15 @@ def parse_one_shot_payload(argv: list[str]) -> tuple[list[str], int]:
 def run_server() -> int:
     try:
         model = load_model()
+        dimensions = int(getattr(model, "get_sentence_embedding_dimension", lambda: 384)())
+        sys.stdout.write(json.dumps({
+            "id": "startup",
+            "ok": True,
+            "model": MODEL_NAME,
+            "dimensions": dimensions,
+            "pid": os.getpid(),
+        }) + "\n")
+        sys.stdout.flush()
     except Exception as error:
         sys.stdout.write(json.dumps({"id": "startup", "ok": False, "error": str(error)}) + "\n")
         sys.stdout.flush()

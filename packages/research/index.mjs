@@ -12,6 +12,40 @@ export const MEMORY_LEVELS = {
   PROVEN_PATTERN: 'level-c-proven-pattern',
 };
 
+const CONSULTATION_SCORE_THRESHOLDS = {
+  localPlusWebAssist: 3.5,
+  webFirstLocalAdaptation: 7.5,
+};
+
+const CONSULTATION_SIGNAL_WEIGHTS = {
+  currentGuidance: 5,
+  versionSpecific: 6,
+  migration: 9.2,
+  securitySensitive: 4.5,
+  resilience: 2.4,
+  newLibraryUsage: 3.2,
+  testing: 1.2,
+  fastMoving: 2,
+};
+
+const LOCAL_CONFIDENCE_WEIGHTS = {
+  low: 4.4,
+  medium: 1.1,
+  high: -3.4,
+};
+
+const REPO_SPECIFIC_WEIGHTS = {
+  low: -0.8,
+  medium: -4.2,
+  high: -5.1,
+};
+
+const REPO_SPECIFIC_CURRENT_GUIDANCE_WEIGHTS = {
+  low: -0.4,
+  medium: -1,
+  high: -1.6,
+};
+
 const FAST_MOVING_TECHS = new Set([
   'next',
   'nextjs',
@@ -265,9 +299,12 @@ export function buildResearchConsultation({
     localConfidence,
     currentProjectName,
   });
-  const mode = decideConsultationMode({
+  const decisionTrace = scoreConsultationNeed({
     signals,
     localConfidence,
+  });
+  const mode = decideConsultationMode({
+    decisionTrace,
   });
   const localContext = buildLocalContext({
     retrievalResponse,
@@ -306,7 +343,7 @@ export function buildResearchConsultation({
   const researchDecision = {
     needsWebResearch: mode !== CONSULTATION_MODES.LOCAL_ONLY,
     triggers: signals.triggers,
-    rationale: buildDecisionRationale({ mode, signals, localConfidence }),
+    rationale: buildDecisionRationale({ mode, signals, localConfidence, decisionTrace }),
     sourcePriority: researchPlan.sourceTargets.map((target) => `${target.tier}: ${target.label}`),
   };
 
@@ -315,6 +352,7 @@ export function buildResearchConsultation({
     currentProjectName: currentProjectName ?? null,
     currentProjectPath: currentProjectPath ?? null,
     mode,
+    decisionTrace,
     localConfidence,
     localContext,
     researchDecision,
@@ -585,27 +623,107 @@ function detectResearchSignals({ query, projectSummary, localConfidence, current
   };
 }
 
-function decideConsultationMode({ signals, localConfidence } = {}) {
-  const explicitCurrentResearch = signals?.currentGuidance || signals?.versionSpecific || signals?.migration;
-  const webFirst = signals?.migration
-    || signals?.versionSpecific
-    || (signals?.currentGuidance && (signals?.fastMoving || signals?.securitySensitive))
-    || (signals?.securitySensitive && localConfidence?.level === 'low')
-    || (signals?.newLibraryUsage && localConfidence?.level === 'low');
+function scoreConsultationNeed({ signals, localConfidence } = {}) {
+  const contributions = [];
+  const addContribution = (factor, weight, reason) => {
+    if (!weight) {
+      return;
+    }
+    contributions.push({
+      factor,
+      weight: Number(weight.toFixed(2)),
+      reason,
+    });
+  };
 
-  if (webFirst) {
+  const explicitCurrentResearch = Boolean(signals?.currentGuidance || signals?.versionSpecific || signals?.migration);
+
+  if (signals?.currentGuidance) {
+    addContribution('current guidance', CONSULTATION_SIGNAL_WEIGHTS.currentGuidance, 'The query explicitly asks for current, recommended, or official guidance.');
+  }
+  if (signals?.versionSpecific) {
+    addContribution('version-specific risk', CONSULTATION_SIGNAL_WEIGHTS.versionSpecific, 'Version-sensitive behavior should be validated against primary documentation.');
+  }
+  if (signals?.migration) {
+    addContribution('migration risk', CONSULTATION_SIGNAL_WEIGHTS.migration, 'Migration and deprecation work should not rely only on local memory.');
+  }
+  if (signals?.securitySensitive) {
+    addContribution('security sensitivity', CONSULTATION_SIGNAL_WEIGHTS.securitySensitive, 'Auth, token, or session behavior needs stronger trust guarantees.');
+  }
+  if (signals?.resilience) {
+    addContribution('resilience behavior', CONSULTATION_SIGNAL_WEIGHTS.resilience, 'Retry, timeout, and backoff behavior often depends on framework-level guidance.');
+  }
+  if (signals?.newLibraryUsage) {
+    addContribution('new library usage', CONSULTATION_SIGNAL_WEIGHTS.newLibraryUsage, 'Library-usage questions benefit from the primary docs and API references.');
+  }
+  if (signals?.testing) {
+    addContribution('testing guidance', CONSULTATION_SIGNAL_WEIGHTS.testing, 'Testing behavior can be framework-sensitive even when local patterns are useful.');
+  }
+  if (signals?.fastMoving) {
+    addContribution('fast-moving stack', CONSULTATION_SIGNAL_WEIGHTS.fastMoving, 'The detected stack changes quickly enough that stale memory is a real risk.');
+  }
+
+  addContribution(
+    'local confidence',
+    LOCAL_CONFIDENCE_WEIGHTS[localConfidence?.level] ?? 0,
+    localConfidence?.level === 'low'
+      ? 'Local recall is thin, so external evidence should carry more weight.'
+      : (localConfidence?.level === 'high'
+        ? 'Local recall is strong enough to reduce unnecessary web escalation.'
+        : 'Local recall is usable but not authoritative on its own.'),
+  );
+
+  if (signals?.repoSpecific) {
+    const repoSpecificWeight = explicitCurrentResearch
+      ? (REPO_SPECIFIC_CURRENT_GUIDANCE_WEIGHTS[localConfidence?.level] ?? -1)
+      : (REPO_SPECIFIC_WEIGHTS[localConfidence?.level] ?? -3.4);
+    addContribution(
+      'repo-specific anchor',
+      repoSpecificWeight,
+      explicitCurrentResearch
+        ? 'The task is repo-shaped, but current or external guidance still matters.'
+        : 'Repo-shaped work should stay local when the current project already has usable evidence.',
+    );
+  }
+
+  if (signals?.securitySensitive && localConfidence?.level === 'low') {
+    addContribution('low-confidence security penalty', 2.2, 'Security-sensitive work with weak local recall should escalate more aggressively.');
+  }
+  if (signals?.currentGuidance && (signals?.fastMoving || signals?.securitySensitive)) {
+    addContribution('current guidance amplification', 1.6, 'Current guidance on a fast-moving or security-sensitive topic should lead the answer.');
+  }
+  if (signals?.migration && (signals?.versionSpecific || signals?.currentGuidance)) {
+    addContribution('migration amplification', 2.4, 'Version-aware migration work is especially likely to drift from local memory.');
+  }
+
+  const score = Number(contributions.reduce((total, item) => total + item.weight, 0).toFixed(2));
+  const primaryDrivers = contributions
+    .filter((item) => item.weight > 0)
+    .sort((left, right) => right.weight - left.weight)
+    .slice(0, 4)
+    .map((item) => `${item.factor}: ${item.reason}`);
+  const stabilizers = contributions
+    .filter((item) => item.weight < 0)
+    .sort((left, right) => left.weight - right.weight)
+    .slice(0, 3)
+    .map((item) => `${item.factor}: ${item.reason}`);
+
+  return {
+    score,
+    thresholds: { ...CONSULTATION_SCORE_THRESHOLDS },
+    contributions,
+    primaryDrivers,
+    stabilizers,
+  };
+}
+
+function decideConsultationMode({ decisionTrace } = {}) {
+  const score = Number(decisionTrace?.score ?? 0);
+  if (score >= CONSULTATION_SCORE_THRESHOLDS.webFirstLocalAdaptation) {
     return CONSULTATION_MODES.WEB_FIRST_LOCAL_ADAPTATION;
   }
 
-  if (signals?.repoSpecific && localConfidence?.level !== 'low' && !explicitCurrentResearch) {
-    return CONSULTATION_MODES.LOCAL_ONLY;
-  }
-
-  const webAssist = explicitCurrentResearch
-    || ((signals?.securitySensitive || signals?.resilience || signals?.newLibraryUsage || signals?.fastMoving) && (!signals?.repoSpecific || localConfidence?.level === 'low'))
-    || localConfidence?.level === 'low';
-
-  if (webAssist) {
+  if (score >= CONSULTATION_SCORE_THRESHOLDS.localPlusWebAssist) {
     return CONSULTATION_MODES.LOCAL_PLUS_WEB_ASSIST;
   }
 
@@ -815,8 +933,10 @@ function buildConsultationMemoryGuidance({ mode, signals, localConfidence, local
   };
 }
 
-function buildDecisionRationale({ mode, signals, localConfidence } = {}) {
-  const reasons = [];
+function buildDecisionRationale({ mode, signals, localConfidence, decisionTrace } = {}) {
+  const reasons = [
+    `Decision score: ${Number(decisionTrace?.score ?? 0).toFixed(2)} (web assist >= ${CONSULTATION_SCORE_THRESHOLDS.localPlusWebAssist}, web first >= ${CONSULTATION_SCORE_THRESHOLDS.webFirstLocalAdaptation}).`,
+  ];
   if (mode === CONSULTATION_MODES.LOCAL_ONLY && localConfidence?.level === 'high') {
     reasons.push('Local confidence is high enough that repo memory should lead the implementation.');
   } else if (mode === CONSULTATION_MODES.LOCAL_ONLY) {
@@ -836,6 +956,14 @@ function buildDecisionRationale({ mode, signals, localConfidence } = {}) {
   }
   if (localConfidence?.level === 'low') {
     reasons.push('Local recall confidence is low, so external guidance needs to carry more weight.');
+  }
+  for (const driver of decisionTrace?.primaryDrivers ?? []) {
+    reasons.push(`Escalation driver: ${driver}`);
+  }
+  if (mode === CONSULTATION_MODES.LOCAL_ONLY) {
+    for (const stabilizer of (decisionTrace?.stabilizers ?? []).slice(0, 2)) {
+      reasons.push(`Local anchor: ${stabilizer}`);
+    }
   }
   return uniqueStrings(reasons).slice(0, 5);
 }

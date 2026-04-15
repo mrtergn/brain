@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { LocalSemanticEmbedder } from '../embeddings/index.mjs';
+import { createCliSemanticEmbedder, describeEmbedderRuntime } from '../embedder-runner/index.mjs';
 import { readProjectNoteContents, writeQueryHistoryNote as writeCanonicalQueryHistoryNote } from '../obsidian-writer/index.mjs';
 import {
   maxEvidenceConfidence,
@@ -28,6 +28,8 @@ import {
   loadCachedProjectSnapshot,
   loadState,
   listCachedProjectSnapshots,
+  previewMemoryAdmission,
+  recordMemoryUsage,
   recordQuery,
   recordOperation,
   saveState,
@@ -55,7 +57,18 @@ const RESEARCH_CANDIDATES_TEMPLATE = [
   '- Use research candidates to prevent the vault from turning into a web clipping dump.',
 ].join('\n');
 
-export async function searchBrain({ query, currentProjectPath, currentProjectName, topK = 6, runtimeOptions, recordUsage = true } = {}) {
+export async function searchBrain({
+  query,
+  currentProjectPath,
+  currentProjectName,
+  topK = 6,
+  runtimeOptions,
+  recordUsage = true,
+  includeRelatedPatterns = true,
+  includeRecentLearnings = true,
+  embedderSelection = null,
+  includeEmbedderRuntime = false,
+} = {}) {
   const {
     readyRuntime,
     resolvedProject,
@@ -63,6 +76,7 @@ export async function searchBrain({ query, currentProjectPath, currentProjectNam
     reasoning,
     relatedPatterns,
     recentLearnings,
+    embedderRuntime,
   } = await gatherLocalBrainContext({
     query,
     currentProjectPath,
@@ -70,8 +84,25 @@ export async function searchBrain({ query, currentProjectPath, currentProjectNam
     topK,
     runtimeOptions,
     includeProjectSummary: false,
-    recentLearningsLimit: 4,
+    includeRelatedPatterns,
+    recentLearningsLimit: includeRecentLearnings ? 4 : 0,
+    embedderSelection,
   });
+
+  const memoryAdmission = recordUsage
+    ? recordMemoryUsage(readyRuntime.state, {
+      at: timestamp(),
+      source: 'query',
+      query: String(query ?? '').trim(),
+      currentProjectName: resolvedProject?.name ?? null,
+      mode: reasoning.mode,
+      results: retrievalResponse.results,
+    }, { config: readyRuntime.config })
+    : previewMemoryAdmission(readyRuntime.state, {
+      query: String(query ?? '').trim(),
+      currentProjectName: resolvedProject?.name ?? null,
+      results: retrievalResponse.results,
+    }, { config: readyRuntime.config });
 
   if (recordUsage) {
     recordQuery(readyRuntime.state, {
@@ -124,10 +155,21 @@ export async function searchBrain({ query, currentProjectPath, currentProjectNam
     },
     relatedPatterns,
     recentLearnings,
+    memoryAdmission,
+    ...(includeEmbedderRuntime ? { embedderRuntime } : {}),
   };
 }
 
-export async function consultBrain({ query, currentProjectPath, currentProjectName, topK = 6, runtimeOptions, recordUsage = true } = {}) {
+export async function consultBrain({
+  query,
+  currentProjectPath,
+  currentProjectName,
+  topK = 6,
+  runtimeOptions,
+  recordUsage = true,
+  embedderSelection = null,
+  includeEmbedderRuntime = false,
+} = {}) {
   const {
     readyRuntime,
     resolvedProject,
@@ -136,6 +178,7 @@ export async function consultBrain({ query, currentProjectPath, currentProjectNa
     relatedPatterns,
     recentLearnings,
     projectSummary,
+    embedderRuntime,
   } = await gatherLocalBrainContext({
     query,
     currentProjectPath,
@@ -144,6 +187,7 @@ export async function consultBrain({ query, currentProjectPath, currentProjectNa
     runtimeOptions,
     includeProjectSummary: true,
     recentLearningsLimit: 4,
+    embedderSelection,
   });
 
   const payload = buildResearchConsultation({
@@ -156,6 +200,23 @@ export async function consultBrain({ query, currentProjectPath, currentProjectNa
     relatedPatterns,
     recentLearnings,
   });
+
+  const memoryAdmission = recordUsage
+    ? recordMemoryUsage(readyRuntime.state, {
+      at: timestamp(),
+      source: 'consult',
+      query: String(query ?? '').trim(),
+      currentProjectName: resolvedProject?.name ?? null,
+      mode: payload.mode,
+      results: retrievalResponse.results,
+      localConfidence: payload.localConfidence.score,
+      webResearchRecommended: payload.researchDecision.needsWebResearch,
+    }, { config: readyRuntime.config })
+    : previewMemoryAdmission(readyRuntime.state, {
+      query: String(query ?? '').trim(),
+      currentProjectName: resolvedProject?.name ?? null,
+      results: retrievalResponse.results,
+    }, { config: readyRuntime.config });
 
   if (recordUsage) {
     recordQuery(readyRuntime.state, {
@@ -177,7 +238,11 @@ export async function consultBrain({ query, currentProjectPath, currentProjectNa
   }
 
   await appendLog(buildLogPath(readyRuntime.config, 'brain-mcp.log'), `brain.consult | query=${JSON.stringify(query)} | project=${resolvedProject?.name ?? 'global'} | mode=${payload.mode}`);
-  return payload;
+  return {
+    ...payload,
+    memoryAdmission,
+    ...(includeEmbedderRuntime ? { embedderRuntime } : {}),
+  };
 }
 
 export async function synthesizeGuidance({
@@ -300,6 +365,7 @@ export async function captureLearning({
   const runtime = await loadBrainRuntime(runtimeOptions);
   let readyRuntime = await ensureKnowledgeReady(runtime, { skipEmbed: true });
   let workerModule = null;
+  const capturedAt = timestamp();
 
   let resolvedProject = await resolveProjectContext(readyRuntime, { projectName });
   if (!resolvedProject && projectName) {
@@ -335,6 +401,7 @@ export async function captureLearning({
   await writeText(learningsPath, appendCanonicalEntry(normalized, entry));
 
   const state = await loadState(readyRuntime.config);
+  state.lastLearnAt = capturedAt;
   recordOperation(state, 'capture-learning', {
     projects: [targetProjectName],
     summary: `Captured learning for ${targetProjectName}: ${title ?? 'untitled learning'}`,
@@ -351,7 +418,7 @@ export async function captureLearning({
     projectName: targetProjectName,
     notePath: learningsPath,
     embedded: Boolean(resolvedProject),
-    capturedAt: timestamp(),
+    capturedAt,
   };
 }
 
@@ -636,7 +703,9 @@ async function gatherLocalBrainContext({
   topK = 6,
   runtimeOptions,
   includeProjectSummary = false,
+  includeRelatedPatterns = true,
   recentLearningsLimit = 4,
+  embedderSelection = null,
 } = {}) {
   const runtime = await loadBrainRuntime(runtimeOptions);
   const readyRuntime = await ensureKnowledgeReady(runtime);
@@ -644,7 +713,9 @@ async function gatherLocalBrainContext({
     projectPath: currentProjectPath,
     projectName: currentProjectName,
   });
-  const embedder = new LocalSemanticEmbedder({ pythonExecutable: readyRuntime.config.pythonExecutable });
+  const embedder = createCliSemanticEmbedder(readyRuntime.config, {
+    selection: embedderSelection,
+  });
   const vectorStore = new ChromaVectorStore(readyRuntime.config);
   const retrievalResponse = await retrieveContext({
     queryText: String(query ?? '').trim(),
@@ -654,15 +725,19 @@ async function gatherLocalBrainContext({
     currentProjectName: resolvedProject?.name ?? '',
   });
   const reasoning = await reasonAboutQuery(readyRuntime.config, readyRuntime.state, retrievalResponse);
-  const relatedPatterns = await getRelatedPatternsInternal(readyRuntime, {
-    query,
-    currentProjectName: resolvedProject?.name,
-    topK: Math.min(Math.max(Number(topK ?? 6), 3), 6),
-  });
-  const recentLearnings = await getRecentLearningsInternal(readyRuntime, {
-    currentProjectName: resolvedProject?.name,
-    limit: recentLearningsLimit,
-  });
+  const relatedPatterns = includeRelatedPatterns
+    ? await getRelatedPatternsInternal(readyRuntime, {
+      query,
+      currentProjectName: resolvedProject?.name,
+      topK: Math.min(Math.max(Number(topK ?? 6), 3), 6),
+    })
+    : [];
+  const recentLearnings = recentLearningsLimit > 0
+    ? await getRecentLearningsInternal(readyRuntime, {
+      currentProjectName: resolvedProject?.name,
+      limit: recentLearningsLimit,
+    })
+    : [];
 
   return {
     readyRuntime,
@@ -671,6 +746,7 @@ async function gatherLocalBrainContext({
     reasoning,
     relatedPatterns,
     recentLearnings,
+    embedderRuntime: describeEmbedderRuntime(embedder, embedderSelection),
     projectSummary: includeProjectSummary && resolvedProject ? await buildProjectSummaryPayload(readyRuntime, resolvedProject) : null,
   };
 }

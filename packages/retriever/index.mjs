@@ -48,6 +48,12 @@ const QUERY_EXPANSION_RULES = [
   },
 ];
 
+const DOCUMENTATION_QUERY_TERMS = new Set(['readme', 'docs', 'documentation', 'architecture', 'guide', 'guidance', 'agent', 'agents', 'copilot', 'prompt', 'prompts', 'onboarding', 'github']);
+const DEBUG_QUERY_TERMS = new Set(['bug', 'issue', 'error', 'failure', 'fail', 'debug', 'fix', 'broken', 'retry', 'retries', 'timeout', 'timeouts', 'reconnect']);
+const BOUNDARY_QUERY_TERMS = new Set(['boundary', 'boundaries', 'safe', 'validation', 'validate', 'contract', 'module', 'modules', 'interface', 'interfaces', 'entrypoint', 'operator', 'workflow', 'shared']);
+const EVIDENCE_QUALITY_RANK = { weak: 1, medium: 2, strong: 3 };
+const KNOWLEDGE_STRENGTH_RANK = { weak: 1, medium: 2, strong: 3 };
+
 export async function retrieveContext({
   queryText,
   topK,
@@ -57,6 +63,7 @@ export async function retrieveContext({
 }) {
   const normalizedTopK = Math.max(Number(topK ?? 6), 1);
   const { expandedQueryText, expansionTerms } = expandQueryText(queryText);
+  const queryIntent = analyzeQueryIntent(queryText);
   const queryEmbedding = await embedder.embedText(expandedQueryText);
 
   const globalResponse = await vectorStore.query(queryEmbedding, { topK: Math.max(normalizedTopK * 4, 12) });
@@ -71,6 +78,7 @@ export async function retrieveContext({
     topK: normalizedTopK,
     currentProjectName,
     expansionTerms,
+    queryIntent,
   });
 
   return {
@@ -101,12 +109,13 @@ export function expandQueryText(queryText) {
   };
 }
 
-function rankResults(queryText, rawResults, { topK, currentProjectName, expansionTerms }) {
+function rankResults(queryText, rawResults, { topK, currentProjectName, expansionTerms, queryIntent }) {
   const ranked = new Map();
   for (const rawResult of rawResults) {
     const normalized = normalizeResult(queryText, rawResult, {
       currentProjectName,
       expansionTerms,
+      queryIntent,
     });
     const existing = ranked.get(normalized.id);
     if (!existing || normalized.relevanceScore > existing.relevanceScore) {
@@ -119,11 +128,11 @@ function rankResults(queryText, rawResults, { topK, currentProjectName, expansio
   }
 
   const sortedResults = [...ranked.values()]
-    .sort((left, right) => right.relevanceScore - left.relevanceScore);
-  return selectDiverseResults(sortedResults, { topK, currentProjectName });
+    .sort((left, right) => compareRankedResults(left, right, { currentProjectName }));
+  return selectDiverseResults(sortedResults, { topK, currentProjectName, queryIntent });
 }
 
-function normalizeResult(queryText, result, { currentProjectName, expansionTerms }) {
+function normalizeResult(queryText, result, { currentProjectName, expansionTerms, queryIntent }) {
   const snippet = truncate((result.document ?? '').replace(/\s+/g, ' '), 280);
   const distance = Number(result.distance ?? 1);
   const queryTokens = new Set(tokenize(queryText));
@@ -148,21 +157,44 @@ function normalizeResult(queryText, result, { currentProjectName, expansionTerms
   const derivedFrom = String(result.metadata?.derivedFrom ?? '').split(' | ').map((value) => value.trim()).filter(Boolean);
   const evidenceSummary = String(result.metadata?.evidenceSummary ?? '').trim();
   const canonicalKnowledgeSource = isReusableKnowledgeSource(noteType, sourcePath);
-  const noteTypeBoost = canonicalKnowledgeSource ? 0.16 : (NOTE_TYPE_BOOSTS[noteType] ?? 0);
-  const currentProjectBoost = currentProjectName && project === currentProjectName ? 0.12 : 0;
+  const trustScore = computeTrustScore({
+    evidenceQuality,
+    confidence,
+    supportCount,
+    knowledgeStrength,
+  });
+  const noteTypeBoost = resolveNoteTypeBoost({
+    noteType,
+    sourcePath,
+    canonicalKnowledgeSource,
+    queryIntent,
+  });
+  const currentProjectBoost = currentProjectName && project === currentProjectName
+    ? (queryIntent?.repoSpecific ? 0.18 : 0.12)
+    : 0;
   const reusablePatternBoost = canonicalKnowledgeSource ? 0.1 : 0;
-  const boundarySignalBoost = hasBoundarySignal(documentText) && matchedTerms.length > 0 ? 0.05 : 0;
-  const evidenceQualityBoost = evidenceQuality === 'strong' ? 0.06 : (evidenceQuality === 'medium' ? 0.03 : 0);
-  const knowledgeStrengthBoost = knowledgeStrength === 'strong' ? 0.05 : (knowledgeStrength === 'medium' ? 0.02 : 0);
-  const supportCountBoost = Math.min(supportCount * 0.015, 0.05);
-  const confidenceBoost = Math.min(clamp(confidence, 0, 1) * 0.04, 0.04);
-  const relevanceScore = clamp((semanticScore * 0.54) + lexicalBonus + expansionBonus + noteTypeBoost + currentProjectBoost + reusablePatternBoost + boundarySignalBoost + evidenceQualityBoost + knowledgeStrengthBoost + supportCountBoost + confidenceBoost, 0, 1);
+  const boundarySignalBoost = queryIntent?.boundaryAware && hasBoundarySignal(documentText) ? 0.05 : 0;
+  const debuggingBoost = queryIntent?.debugging && hasDebugSignal(documentText) ? 0.04 : 0;
+  const documentationBoost = queryIntent?.documentation && hasDocumentationSignal({ documentText, noteType, sourcePath }) ? 0.05 : 0;
+  const phraseBonus = computePhraseBonus(queryText, documentText, queryIntent);
+  const trustBonus = trustScore * (queryIntent?.repoSpecific || queryIntent?.shortQuery ? 0.14 : 0.1);
+  const weakCrossProjectPenalty = currentProjectName
+    && project !== currentProjectName
+    && queryIntent?.repoSpecific
+    && trustScore < 0.46
+      ? 0.06
+      : 0;
+  const relevanceScore = clamp((semanticScore * 0.48) + lexicalBonus + expansionBonus + phraseBonus + noteTypeBoost + currentProjectBoost + reusablePatternBoost + boundarySignalBoost + debuggingBoost + documentationBoost + trustBonus - weakCrossProjectPenalty, 0, 1);
   const matchSignals = uniqueStrings([
     semanticScore >= 0.45 ? 'semantic similarity' : '',
     currentProjectBoost > 0 ? 'current project boost' : '',
     noteTypeBoost > 0 ? `${noteType} note priority` : '',
     reusablePatternBoost > 0 ? 'reusable knowledge boost' : '',
     boundarySignalBoost > 0 ? 'boundary signal boost' : '',
+    debuggingBoost > 0 ? 'debugging signal boost' : '',
+    documentationBoost > 0 ? 'documentation signal boost' : '',
+    phraseBonus > 0 ? 'phrase match' : '',
+    trustScore >= 0.7 ? 'high trust score' : '',
     evidenceQuality === 'strong' ? 'strong evidence quality' : '',
     knowledgeStrength === 'strong' ? 'strong knowledge structure' : '',
     supportCount >= 2 ? 'multi-source support' : '',
@@ -190,6 +222,7 @@ function normalizeResult(queryText, result, { currentProjectName, expansionTerms
     supportingSources,
     derivedFrom,
     evidenceSummary,
+    trustScore: Number(trustScore.toFixed(4)),
     matchedTerms: uniqueStrings([...matchedTerms, ...matchedExpansionTerms]),
     matchSignals,
     whyMatched: buildWhyMatched(matchSignals, uniqueStrings([...matchedTerms, ...matchedExpansionTerms])),
@@ -220,12 +253,107 @@ function computeLexicalBonus(queryTokens, documentTokens, maxBonus) {
   return clamp((matches / Math.max(queryTokens.size, 1)) * maxBonus, 0, maxBonus);
 }
 
+function analyzeQueryIntent(queryText) {
+  const normalizedQuery = String(queryText ?? '').trim();
+  const tokens = tokenize(normalizedQuery);
+  const lowerQuery = normalizedQuery.toLowerCase();
+  return {
+    repoSpecific: /(this repo|this project|current project|without breaking|safe place|safe extension point|existing pattern|shared client|shared wrapper|entrypoint|boundary|boundaries|module|operator|vault|workflow)/i.test(lowerQuery),
+    debugging: tokens.some((token) => DEBUG_QUERY_TERMS.has(token)),
+    documentation: tokens.some((token) => DOCUMENTATION_QUERY_TERMS.has(token)),
+    boundaryAware: /(without breaking|safe place|boundary|contract|validation surface|safe change|shared client|shared wrapper)/i.test(lowerQuery)
+      || tokens.some((token) => BOUNDARY_QUERY_TERMS.has(token)),
+    shortQuery: tokens.length > 0 && tokens.length <= 4,
+  };
+}
+
+function resolveNoteTypeBoost({ noteType, sourcePath, canonicalKnowledgeSource, queryIntent }) {
+  let boost = canonicalKnowledgeSource ? 0.16 : (NOTE_TYPE_BOOSTS[noteType] ?? 0);
+  if (queryIntent?.debugging && noteType === 'learnings') {
+    boost += 0.04;
+  }
+  if (queryIntent?.documentation && /documentation-style-patterns/i.test(sourcePath)) {
+    boost += 0.08;
+  }
+  if (queryIntent?.boundaryAware && noteType === 'prompts') {
+    boost += 0.04;
+  }
+  return boost;
+}
+
+function computePhraseBonus(queryText, documentText, queryIntent) {
+  const queryTokens = tokenize(queryText);
+  if (queryTokens.length < 2) {
+    return 0;
+  }
+
+  const normalizedDocument = String(documentText ?? '').toLowerCase().replace(/[^a-z0-9_\-\s]+/g, ' ');
+  const normalizedQuery = queryTokens.join(' ');
+  if (normalizedDocument.includes(normalizedQuery)) {
+    return queryIntent?.shortQuery ? 0.1 : 0.07;
+  }
+
+  const phraseWindow = Math.min(queryTokens.length, 3);
+  for (let size = phraseWindow; size >= 2; size -= 1) {
+    for (let index = 0; index <= queryTokens.length - size; index += 1) {
+      const phrase = queryTokens.slice(index, index + size).join(' ');
+      if (normalizedDocument.includes(phrase)) {
+        return queryIntent?.shortQuery ? 0.07 : 0.04;
+      }
+    }
+  }
+
+  return 0;
+}
+
+function computeTrustScore({ evidenceQuality, confidence, supportCount, knowledgeStrength }) {
+  const evidenceScore = evidenceQuality === 'strong' ? 1 : (evidenceQuality === 'medium' ? 0.62 : 0.22);
+  const structureScore = knowledgeStrength === 'strong' ? 1 : (knowledgeStrength === 'medium' ? 0.64 : 0.28);
+  const confidenceScore = clamp(confidence, 0, 1);
+  const supportScore = clamp(supportCount / 3, 0, 1);
+  return clamp((evidenceScore * 0.38) + (confidenceScore * 0.32) + (supportScore * 0.18) + (structureScore * 0.12), 0, 1);
+}
+
+function compareRankedResults(left, right, { currentProjectName = '' } = {}) {
+  const comparisons = [
+    Number(right.relevanceScore ?? 0) - Number(left.relevanceScore ?? 0),
+    Number(right.trustScore ?? 0) - Number(left.trustScore ?? 0),
+    Number(Boolean(currentProjectName && right.project === currentProjectName)) - Number(Boolean(currentProjectName && left.project === currentProjectName)),
+    Number(right.supportCount ?? 0) - Number(left.supportCount ?? 0),
+    (EVIDENCE_QUALITY_RANK[right.evidenceQuality] ?? 0) - (EVIDENCE_QUALITY_RANK[left.evidenceQuality] ?? 0),
+    (KNOWLEDGE_STRENGTH_RANK[right.knowledgeStrength] ?? 0) - (KNOWLEDGE_STRENGTH_RANK[left.knowledgeStrength] ?? 0),
+    Number(right.semanticScore ?? 0) - Number(left.semanticScore ?? 0),
+  ];
+
+  for (const delta of comparisons) {
+    if (delta !== 0) {
+      return delta;
+    }
+  }
+
+  return String(left.project ?? '')
+    .localeCompare(String(right.project ?? ''))
+    || String(left.noteType ?? '').localeCompare(String(right.noteType ?? ''))
+    || String(left.sourcePath ?? '').localeCompare(String(right.sourcePath ?? ''))
+    || String(left.id ?? '').localeCompare(String(right.id ?? ''));
+}
+
 function isReusableKnowledgeSource(noteType, sourcePath) {
   return noteType === 'knowledge' && /04_Knowledge_Base\/(?:reusable-patterns|documentation-style-patterns)\.md$/i.test(String(sourcePath ?? '').replace(/\\/g, '/'));
 }
 
 function hasBoundarySignal(documentText) {
   return /(do not|must not|keep|preserve|avoid|validate|test|healthcheck|contract|boundary|constraint|read-only|local-first|runtime state|vault|repo-local|evidence|operator)/i.test(documentText);
+}
+
+function hasDebugSignal(documentText) {
+  return /(bug|debug|failure|error|fix|root cause|retry|timeout|reconnect|diagnostic|incident|symptom)/i.test(documentText);
+}
+
+function hasDocumentationSignal({ documentText, noteType, sourcePath }) {
+  return noteType === 'knowledge'
+    || /(documentation|readme|architecture|operator guide|agent guidance|copilot|onboarding|troubleshooting|github surface)/i.test(String(documentText ?? ''))
+    || /documentation-style-patterns|README\.md|ARCHITECTURE\.md|OPERATOR_GUIDE\.md|AGENTS\.md|copilot-instructions\.md/i.test(String(sourcePath ?? ''));
 }
 
 function buildWhyMatched(matchSignals, matchedTerms) {
@@ -239,8 +367,20 @@ function buildWhyMatched(matchSignals, matchedTerms) {
   if (matchSignals.includes('semantic similarity')) {
     reasons.push('strong semantic similarity');
   }
+  if (matchSignals.includes('phrase match')) {
+    reasons.push('matched a direct query phrase');
+  }
   if (matchSignals.includes('query expansion match')) {
     reasons.push('matched related bug/debug terms from query expansion');
+  }
+  if (matchSignals.includes('boundary signal boost')) {
+    reasons.push('aligned with a boundary or safe-change signal');
+  }
+  if (matchSignals.includes('debugging signal boost')) {
+    reasons.push('aligned with a debugging or failure-mode signal');
+  }
+  if (matchSignals.includes('documentation signal boost')) {
+    reasons.push('aligned with a documentation or repo-surface signal');
   }
   if (matchSignals.includes('strong evidence quality')) {
     reasons.push('backed by strong evidence quality');
@@ -269,6 +409,8 @@ function buildWhyTrusted({ sourceKind, knowledgeType, knowledgeStrength, evidenc
   if (knowledgeStrength === 'strong') {
     reasons.push('knowledge structure is strong');
   }
+  const trustScore = computeTrustScore({ evidenceQuality, confidence, supportCount, knowledgeStrength });
+  reasons.push(`trust score: ${Number(trustScore.toFixed(2))}`);
   reasons.push(`evidence quality: ${evidenceQuality}`);
   reasons.push(`confidence: ${Number(clamp(confidence, 0, 1).toFixed(2))}`);
   if (supportCount > 0) {
@@ -326,7 +468,7 @@ function normalizeEvidenceQuality(value) {
   return 'weak';
 }
 
-function selectDiverseResults(results, { topK, currentProjectName }) {
+function selectDiverseResults(results, { topK, currentProjectName, queryIntent }) {
   if (!currentProjectName) {
     return results.slice(0, topK);
   }
@@ -336,7 +478,8 @@ function selectDiverseResults(results, { topK, currentProjectName }) {
   const currentProjectResults = results.filter((result) => result.project === currentProjectName);
   const crossProjectResults = results.filter((result) => result.project !== currentProjectName);
   const currentBest = currentProjectResults[0] ?? null;
-  const crossBest = crossProjectResults.find((result) => shouldIncludeCrossProjectResult(result, currentBest)) ?? null;
+  const crossBest = crossProjectResults.find((result) => shouldIncludeCrossProjectResult(result, currentBest, queryIntent)) ?? null;
+  const preferredCurrentProjectCount = queryIntent?.repoSpecific ? Math.min(2, topK) : 1;
 
   const pushResult = (result) => {
     if (!result || seenIds.has(result.id) || selected.length >= topK) {
@@ -351,29 +494,50 @@ function selectDiverseResults(results, { topK, currentProjectName }) {
 
   for (const result of results) {
     if (result.project !== currentProjectName) {
-      const selectedCrossProjectCount = selected.filter((entry) => entry.project !== currentProjectName).length;
-      if (selectedCrossProjectCount >= 2 && result.relevanceScore < 0.58) {
+      const selectedCurrentProjectCount = selected.filter((entry) => entry.project === currentProjectName).length;
+      if (selectedCurrentProjectCount < preferredCurrentProjectCount
+        && currentProjectResults.length >= preferredCurrentProjectCount
+        && !shouldIncludeCrossProjectResult(result, currentBest, queryIntent)) {
         continue;
       }
-      if (currentBest && result.relevanceScore + 0.08 < currentBest.relevanceScore && !result.matchSignals.includes('reusable knowledge boost')) {
+      const selectedCrossProjectCount = selected.filter((entry) => entry.project !== currentProjectName).length;
+      if (selectedCrossProjectCount >= (queryIntent?.repoSpecific ? 1 : 2)
+        && result.relevanceScore < (queryIntent?.repoSpecific ? 0.62 : 0.58)
+        && Number(result.trustScore ?? 0) < 0.7) {
+        continue;
+      }
+      if (currentBest
+        && result.relevanceScore + (queryIntent?.repoSpecific ? 0.04 : 0.08) < currentBest.relevanceScore
+        && !shouldIncludeCrossProjectResult(result, currentBest, queryIntent)) {
         continue;
       }
     }
     pushResult(result);
   }
 
-  return selected.slice(0, topK);
+  return [...selected]
+    .sort((left, right) => compareRankedResults(left, right, { currentProjectName }))
+    .slice(0, topK);
 }
 
-function shouldIncludeCrossProjectResult(result, currentBest) {
+function shouldIncludeCrossProjectResult(result, currentBest, queryIntent) {
   if (!result) {
     return false;
   }
   if (result.matchSignals.includes('reusable knowledge boost')) {
     return true;
   }
-  if (!currentBest) {
-    return result.relevanceScore >= 0.52;
+  if (result.evidenceQuality === 'strong' && Number(result.trustScore ?? 0) >= 0.7 && result.relevanceScore >= 0.48) {
+    return true;
   }
-  return result.relevanceScore >= 0.58 || result.relevanceScore + 0.06 >= currentBest.relevanceScore;
+  if (!currentBest) {
+    return result.relevanceScore >= (queryIntent?.repoSpecific ? 0.58 : 0.52);
+  }
+  if (queryIntent?.repoSpecific) {
+    return result.relevanceScore >= 0.68
+      || (Number(result.trustScore ?? 0) >= 0.78 && result.relevanceScore + 0.02 >= currentBest.relevanceScore);
+  }
+  return result.relevanceScore >= 0.58
+    || result.relevanceScore + 0.06 >= currentBest.relevanceScore
+    || Number(result.trustScore ?? 0) >= 0.76;
 }

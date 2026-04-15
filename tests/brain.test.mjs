@@ -2,19 +2,26 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 
-import { searchBrain } from '../packages/brain-service/index.mjs';
+import { captureLearning, consultBrain, searchBrain } from '../packages/brain-service/index.mjs';
 import { buildResearchConsultation, synthesizeLocalAndExternalGuidance } from '../packages/research/index.mjs';
 import { BRAIN_MCP_TOOL_NAMES } from '../apps/mcp-server/index.mjs';
-import { runDoctor } from '../apps/worker/index.mjs';
+import { runDoctor, runStatus } from '../apps/worker/index.mjs';
 import { buildProjectKnowledgeSources, chunkProjectKnowledge, GLOBAL_KNOWLEDGE_CACHE_KEY } from '../packages/chunker/index.mjs';
-import { LocalSemanticEmbedder, shutdownEmbeddingService } from '../packages/embeddings/index.mjs';
+import {
+  inspectEmbedderRunner,
+  resolveCliEmbedderSelection,
+  startEmbedderRunner,
+  stopEmbedderRunner,
+} from '../packages/embedder-runner/index.mjs';
+import { getEmbeddingServiceStatus, LocalSemanticEmbedder, prewarmEmbeddingService, shutdownEmbeddingService } from '../packages/embeddings/index.mjs';
 import { normalizeProject } from '../packages/normalizer/index.mjs';
 import { syncNotes, writeQueryHistoryNote } from '../packages/obsidian-writer/index.mjs';
-import { expandQueryText } from '../packages/retriever/index.mjs';
+import { expandQueryText, retrieveContext } from '../packages/retriever/index.mjs';
 import { buildRuntimeConfig } from '../packages/shared/index.mjs';
-import { loadState, normalizeState } from '../packages/state-manager/index.mjs';
+import { getLastLearningActivityAt, loadState, normalizeState, recordMemoryUsage, summarizeMemoryAdmission } from '../packages/state-manager/index.mjs';
+import { shutdownChromaService } from '../packages/vector-store/index.mjs';
 import { cleanupDeprecatedVaultArtifacts, validateVaultContract } from '../packages/vault-contract/index.mjs';
 import { analyzeProject } from '../scripts/ai-brain/lib/project-analysis.mjs';
 
@@ -22,6 +29,7 @@ const TEMP_PATHS = [];
 
 after(async () => {
   await shutdownEmbeddingService();
+  await shutdownChromaService();
   await Promise.all(TEMP_PATHS.map(async (tempPath) => {
     await rm(tempPath, { recursive: true, force: true });
   }));
@@ -54,11 +62,293 @@ test('semantic embedder produces equal vectors for equal text', async () => {
   assert.deepEqual(left, right);
 });
 
+test('prewarmEmbeddingService readies and reuses the managed embedder without a duplicate process', async () => {
+  await shutdownEmbeddingService();
+
+  const first = await prewarmEmbeddingService({
+    timeoutMs: 30000,
+    reason: 'test-prewarm',
+    strategy: 'blocking',
+  });
+
+  assert.equal(first.outcome, 'ready');
+  assert.ok(first.servicePid);
+  const statusAfterFirst = getEmbeddingServiceStatus();
+  assert.equal(statusAfterFirst.serviceState, 'ready');
+  assert.equal(statusAfterFirst.servicePid, first.servicePid);
+
+  const second = await prewarmEmbeddingService({
+    timeoutMs: 30000,
+    reason: 'test-prewarm-reuse',
+    strategy: 'blocking',
+  });
+
+  assert.equal(second.outcome, 'reused');
+  assert.equal(second.servicePid, first.servicePid);
+});
+
+test('prewarmEmbeddingService timeout resets the managed embedder safely', async () => {
+  await shutdownEmbeddingService();
+
+  const timedOut = await prewarmEmbeddingService({
+    timeoutMs: 1,
+    reason: 'test-timeout',
+    strategy: 'blocking',
+  });
+
+  assert.equal(timedOut.outcome, 'timed-out');
+  assert.equal(getEmbeddingServiceStatus().serviceState, 'idle');
+});
+
+test('inspectEmbedderRunner reports not running before any runner is started', async () => {
+  const fixture = await createRuntimeFixture('brain-runner-inspect-');
+  const config = buildRuntimeConfig({
+    ...fixture.runtimeOptions,
+    embedderRunnerMode: 'auto',
+  });
+
+  const status = await inspectEmbedderRunner(config);
+
+  assert.equal(status.running, false);
+  assert.equal(status.stale, false);
+  assert.equal(status.pid, null);
+  assert.equal(status.backendIfQueriedNow, 'auto-start-runner');
+});
+
+test('startEmbedderRunner creates a healthy runtime and stopEmbedderRunner cleans it up without touching admission state', async () => {
+  const fixture = await createRuntimeFixture('brain-runner-start-stop-');
+  const config = buildRuntimeConfig({
+    ...fixture.runtimeOptions,
+    embedderRunnerMode: 'auto',
+  });
+  const before = await loadState(config);
+
+  const started = await startEmbedderRunner(config, { reason: 'test start-stop' });
+  try {
+    assert.equal(started.status.running, true);
+    assert.ok(started.status.pid);
+    assert.equal(started.status.model, 'all-MiniLM-L6-v2');
+    assert.equal(started.status.dimensions, 384);
+
+    const running = await inspectEmbedderRunner(config);
+    assert.equal(running.running, true);
+    assert.equal(running.pid, started.status.pid);
+    assert.equal(running.backendIfQueriedNow, 'runner');
+  } finally {
+    await stopEmbedderRunner(config, { reason: 'test cleanup' });
+  }
+
+  const stopped = await inspectEmbedderRunner(config);
+  const after = await loadState(config);
+  assert.equal(stopped.running, false);
+  assert.equal(after.queryHistory.length, before.queryHistory.length);
+  assert.equal(after.memoryAdmission.usageEvents.length, before.memoryAdmission.usageEvents.length);
+});
+
+test('startEmbedderRunner cleans stale pid and lock artifacts before starting', async () => {
+  const fixture = await createRuntimeFixture('brain-runner-stale-');
+  const config = buildRuntimeConfig({
+    ...fixture.runtimeOptions,
+    embedderRunnerMode: 'auto',
+  });
+
+  await mkdir(path.dirname(config.embedderRunnerPidPath), { recursive: true });
+  await mkdir(path.dirname(config.embedderRunnerSocketPath), { recursive: true });
+  await writeFile(config.embedderRunnerPidPath, '999999\n', 'utf8');
+  await writeFile(config.embedderRunnerSocketPath, 'stale', 'utf8');
+  await writeFile(config.embedderRunnerLockPath, '{}', 'utf8');
+  const staleAt = new Date(Date.now() - 60_000);
+  await utimes(config.embedderRunnerLockPath, staleAt, staleAt);
+
+  const before = await inspectEmbedderRunner(config);
+  assert.equal(before.stale, true);
+
+  const started = await startEmbedderRunner(config, { reason: 'test stale cleanup' });
+  try {
+    assert.equal(started.status.running, true);
+    assert.equal(started.status.stale, false);
+    await assert.rejects(access(config.embedderRunnerLockPath));
+  } finally {
+    await stopEmbedderRunner(config, { reason: 'test cleanup' });
+  }
+});
+
+test('startEmbedderRunner prevents duplicate starts under concurrent calls', async () => {
+  const fixture = await createRuntimeFixture('brain-runner-duplicate-');
+  const config = buildRuntimeConfig({
+    ...fixture.runtimeOptions,
+    embedderRunnerMode: 'auto',
+  });
+
+  const [first, second] = await Promise.all([
+    startEmbedderRunner(config, { reason: 'test duplicate first' }),
+    startEmbedderRunner(config, { reason: 'test duplicate second' }),
+  ]);
+
+  try {
+    assert.equal(first.status.running, true);
+    assert.equal(second.status.running, true);
+    assert.equal(first.status.pid, second.status.pid);
+    assert.ok(['started', 'already-running'].includes(first.action));
+    assert.ok(['started', 'already-running'].includes(second.action));
+  } finally {
+    await stopEmbedderRunner(config, { reason: 'test cleanup' });
+  }
+});
+
+test('resolveCliEmbedderSelection falls back in auto mode and fails clearly in require mode', async () => {
+  const fallbackFixture = await createRuntimeFixture('brain-runner-auto-fallback-');
+  const fallbackConfig = buildRuntimeConfig({
+    ...fallbackFixture.runtimeOptions,
+    embedderRunnerMode: 'auto',
+  });
+
+  const fallbackSelection = await resolveCliEmbedderSelection(fallbackConfig, {
+    command: 'doctor',
+    allowAutoStart: false,
+  });
+  assert.equal(fallbackSelection.backend, 'in-process');
+  assert.match(fallbackSelection.fallbackReason, /not running/i);
+
+  const requireFixture = await createRuntimeFixture('brain-runner-require-');
+  const requireConfig = buildRuntimeConfig({
+    ...requireFixture.runtimeOptions,
+    embedderRunnerMode: 'require',
+    embedderRunnerStartupTimeoutMs: 500,
+    pythonExecutable: path.join(requireFixture.root, 'missing-python'),
+  });
+
+  await assert.rejects(
+    resolveCliEmbedderSelection(requireConfig, { command: 'query', allowAutoStart: false }),
+    /Persistent embedder runner is required but unavailable/,
+  );
+  await stopEmbedderRunner(requireConfig, { force: true, reason: 'test cleanup after require failure' });
+});
+
 test('query expansion adds related auth and retry terms for messy bug queries', () => {
   const expanded = expandQueryText('auth retry bug');
   assert.ok(expanded.expandedQueryText.includes('related concepts:'));
   assert.ok(expanded.expansionTerms.includes('authentication'));
   assert.ok(expanded.expansionTerms.includes('backoff'));
+});
+
+test('retrieveContext prefers strong current-project evidence over weaker cross-project similarity for repo-specific queries', async () => {
+  const embedder = {
+    async embedText() {
+      return [0.25, 0.75];
+    },
+  };
+  const currentProjectResult = {
+    id: 'brain-learning',
+    distance: 0.29,
+    document: 'Place retry behavior at the shared client boundary instead of scattering retries across callers. Validate the change with the shared client tests.',
+    metadata: {
+      project: 'brain',
+      noteType: 'learnings',
+      sourcePath: '/tmp/brain/learnings.md',
+      sourceKind: 'note',
+      knowledgeType: 'proven-learning',
+      knowledgeStrength: 'strong',
+      evidenceQuality: 'strong',
+      confidence: 0.92,
+      supportCount: 2,
+      supportingSources: JSON.stringify([
+        {
+          sourcePath: 'README.md',
+          sourceKind: 'readme',
+          sourceSection: 'Boundaries',
+          excerpt: 'Place retry behavior at the shared client boundary.',
+        },
+      ]),
+      derivedFrom: 'explicit-doc',
+      evidenceSummary: 'Shared client boundary with strong evidence support.',
+    },
+  };
+  const crossProjectResult = {
+    id: 'other-learning',
+    distance: 0.12,
+    document: 'Retry behavior should be centralized somewhere in the request path for maintainability.',
+    metadata: {
+      project: 'other-repo',
+      noteType: 'learnings',
+      sourcePath: '/tmp/other/learnings.md',
+      sourceKind: 'note',
+      knowledgeType: 'proven-learning',
+      knowledgeStrength: 'strong',
+      evidenceQuality: 'weak',
+      confidence: 0.34,
+      supportCount: 0,
+      supportingSources: '[]',
+      derivedFrom: 'heuristic-fallback',
+      evidenceSummary: 'Weak heuristic retry guidance.',
+    },
+  };
+  const vectorStore = {
+    async query(_embedding, options = {}) {
+      if (options.where?.project === 'brain') {
+        return { results: [currentProjectResult] };
+      }
+      return { results: [crossProjectResult, currentProjectResult] };
+    },
+  };
+
+  const payload = await retrieveContext({
+    queryText: 'safe place in this repo to change retry logic without breaking the shared client boundary',
+    topK: 3,
+    currentProjectName: 'brain',
+    embedder,
+    vectorStore,
+  });
+
+  assert.equal(payload.results[0].project, 'brain');
+  assert.equal(payload.results[0].evidenceQuality, 'strong');
+  assert.ok(payload.results[0].relevanceScore >= payload.results[1].relevanceScore);
+});
+
+test('retrieveContext uses deterministic tie-breakers when ranked results have equal scores', async () => {
+  const embedder = {
+    async embedText() {
+      return [0.5, 0.5];
+    },
+  };
+  const buildTiedResult = (project) => ({
+    id: `${project}-learning`,
+    distance: 0.3,
+    document: 'Shared retry boundary guidance for outbound request handling.',
+    metadata: {
+      project,
+      noteType: 'learnings',
+      sourcePath: `/tmp/${project}/learnings.md`,
+      sourceKind: 'note',
+      knowledgeType: 'proven-learning',
+      knowledgeStrength: 'strong',
+      evidenceQuality: 'strong',
+      confidence: 0.9,
+      supportCount: 1,
+      supportingSources: JSON.stringify([]),
+      derivedFrom: 'explicit-doc',
+      evidenceSummary: 'Tied ranking fixture.',
+    },
+  });
+  const vectorStore = {
+    async query() {
+      return {
+        results: [
+          buildTiedResult('beta'),
+          buildTiedResult('alpha'),
+        ],
+      };
+    },
+  };
+
+  const payload = await retrieveContext({
+    queryText: 'shared retry boundary',
+    topK: 2,
+    embedder,
+    vectorStore,
+  });
+
+  assert.deepEqual(payload.results.map((result) => result.project), ['alpha', 'beta']);
 });
 
 test('project analysis extracts documentation-style patterns from strong repo surfaces', async () => {
@@ -290,6 +580,8 @@ test('searchBrain bootstraps a cold runtime and embeds global knowledge notes', 
   });
 
   assert.ok(Array.isArray(payload.results));
+  assert.equal(payload.memoryAdmission.recorded, true);
+  assert.ok(payload.memoryAdmission.queryFingerprint.length > 0);
   const config = buildRuntimeConfig(fixture.runtimeOptions);
   const state = await loadState(config);
   assert.ok(state.lastEmbedAt);
@@ -298,6 +590,103 @@ test('searchBrain bootstraps a cold runtime and embeds global knowledge notes', 
   const knowledgeChunks = JSON.parse(await readFile(knowledgeChunkPath, 'utf8'));
   assert.ok(knowledgeChunks.some((chunk) => /reusable-patterns\.md$/i.test(chunk.sourcePath)));
   assert.ok(knowledgeChunks.some((chunk) => /documentation-style-patterns\.md$/i.test(chunk.sourcePath)));
+});
+
+test('searchBrain and consultBrain still work after embedder prewarm', async () => {
+  const fixture = await createRuntimeFixture('brain-prewarm-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+
+  const prewarm = await prewarmEmbeddingService({
+    pythonExecutable: config.pythonExecutable,
+    timeoutMs: 30000,
+    reason: 'test-runtime-prewarm',
+    strategy: 'blocking',
+  });
+
+  assert.ok(['ready', 'reused'].includes(prewarm.outcome));
+
+  const searchPayload = await searchBrain({
+    query: 'read-only inputs',
+    currentProjectName: 'sample',
+    runtimeOptions: fixture.runtimeOptions,
+  });
+  assert.ok(searchPayload.results.length > 0);
+
+  const consultation = await consultBrain({
+    query: 'best practice for token refresh handling',
+    currentProjectName: 'sample',
+    runtimeOptions: fixture.runtimeOptions,
+    recordUsage: false,
+  });
+  assert.ok(['local-only', 'local-plus-web-assist', 'web-first-local-adaptation'].includes(consultation.mode));
+  assert.ok(consultation.decisionTrace);
+});
+
+test('searchBrain and consultBrain can reuse the persistent embedder runner without changing behavior', async () => {
+  const fixture = await createRuntimeFixture('brain-runner-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+  const runtimeOptions = {
+    ...fixture.runtimeOptions,
+    embedderRunnerMode: 'auto',
+  };
+  const config = buildRuntimeConfig(runtimeOptions);
+  await startEmbedderRunner(config, { reason: 'test runtime runner reuse' });
+
+  try {
+    const selection = await resolveCliEmbedderSelection(config, {
+      command: 'query',
+      allowAutoStart: true,
+    });
+    const searchPayload = await searchBrain({
+      query: 'read-only inputs',
+      currentProjectName: 'sample',
+      runtimeOptions,
+      includeEmbedderRuntime: true,
+      embedderSelection: selection,
+    });
+    assert.ok(searchPayload.results.length > 0);
+    assert.equal(searchPayload.embedderRuntime.backend, 'runner');
+
+    const consultation = await consultBrain({
+      query: 'best practice for token refresh handling',
+      currentProjectName: 'sample',
+      runtimeOptions,
+      recordUsage: false,
+      includeEmbedderRuntime: true,
+      embedderSelection: selection,
+    });
+    assert.ok(['local-only', 'local-plus-web-assist', 'web-first-local-adaptation'].includes(consultation.mode));
+    assert.equal(consultation.embedderRuntime.backend, 'runner');
+  } finally {
+    await stopEmbedderRunner(config, { reason: 'test cleanup' });
+  }
+});
+
+test('captureLearning appends a structured learning through the supported brain-service path', async () => {
+  const fixture = await createRuntimeFixture('brain-capture-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+
+  const payload = await captureLearning({
+    title: 'Capture learning regression test',
+    projectName: 'sample',
+    problem: 'Verify captureLearning after runtime export changes.',
+    context: 'Strict audit regression coverage.',
+    solution: 'Call the supported brain-service captureLearning path with fixture runtime options.',
+    whyItWorked: 'The brain-service and state-manager exports stay in sync for direct capture invocation.',
+    reusablePattern: 'Add a regression test when long-lived runtime exports change.',
+    tags: ['test', 'capture-learning'],
+    runtimeOptions: fixture.runtimeOptions,
+  });
+
+  assert.equal(payload.projectName, 'sample');
+  assert.equal(payload.embedded, true);
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+  const state = await loadState(config);
+  assert.equal(state.lastLearnAt, payload.capturedAt);
+  const noteText = await readFile(path.join(fixture.vaultRoot, '01_Projects', 'sample', 'learnings.md'), 'utf8');
+  assert.match(noteText, /Capture learning regression test/);
+  assert.match(noteText, /Strict audit regression coverage/);
 });
 
 test('syncNotes keeps global summaries based on the full knowledge project set during scoped sync', async () => {
@@ -362,6 +751,8 @@ test('research consultation escalates token refresh best-practice queries to web
   assert.equal(consultation.mode, 'web-first-local-adaptation');
   assert.equal(consultation.researchDecision.needsWebResearch, true);
   assert.ok(consultation.researchPlan.sourceTargets.some((target) => target.tier === 'tier-1-official'));
+  assert.ok(consultation.decisionTrace.score >= consultation.decisionTrace.thresholds.webFirstLocalAdaptation);
+  assert.ok(consultation.decisionTrace.primaryDrivers.some((item) => /current guidance|security/i.test(item)));
 });
 
 test('research consultation stays local-only for repo-shaped questions with strong local evidence', () => {
@@ -474,6 +865,8 @@ test('research consultation stays local-only for medium-confidence repo-specific
 
   assert.equal(consultation.mode, 'local-only');
   assert.equal(consultation.researchDecision.needsWebResearch, false);
+  assert.ok(consultation.decisionTrace.score < consultation.decisionTrace.thresholds.localPlusWebAssist);
+  assert.ok(consultation.decisionTrace.stabilizers.some((item) => /repo-specific anchor/i.test(item)));
 });
 
 test('repo-specific consultation lowers confidence when cross-project evidence outranks current-project evidence', () => {
@@ -868,11 +1261,55 @@ test('runDoctor does not add query history entries during smoke checks', async (
 
   const config = buildRuntimeConfig(fixture.runtimeOptions);
   const before = await loadState(config);
-  await runDoctor(fixture.runtimeOptions);
+  const doctorReport = await runDoctor(fixture.runtimeOptions);
   const afterState = await loadState(config);
 
   assert.equal(afterState.queryHistory.length, before.queryHistory.length);
   assert.deepEqual(afterState.queryHistory.map((entry) => entry.query), before.queryHistory.map((entry) => entry.query));
+  assert.equal(afterState.memoryAdmission.usageEvents.length, before.memoryAdmission.usageEvents.length);
+  assert.ok(doctorReport.embedderPrewarm);
+  assert.ok(['ready', 'reused', 'timed-out', 'failed', 'skipped'].includes(doctorReport.embedderPrewarm.outcome));
+  assert.ok(doctorReport.retrievalDiagnostics);
+  assert.ok(doctorReport.retrievalDiagnostics.projects.length >= 1);
+  assert.ok(typeof doctorReport.queryCheck.latencyMs === 'number');
+  assert.ok(typeof doctorReport.consultCheck.decisionScore === 'number');
+  assert.ok(doctorReport.memoryAdmission);
+});
+
+test('runStatus and runDoctor expose runner diagnostics when the runner is already active', async () => {
+  const fixture = await createRuntimeFixture('brain-doctor-runner-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+  const runtimeOptions = {
+    ...fixture.runtimeOptions,
+    embedderRunnerMode: 'auto',
+  };
+  const config = buildRuntimeConfig(runtimeOptions);
+  await searchBrain({
+    query: 'read-only inputs',
+    currentProjectName: 'sample',
+    runtimeOptions: fixture.runtimeOptions,
+  });
+  await startEmbedderRunner(config, { reason: 'test doctor status runner diagnostics' });
+  const before = await loadState(config);
+
+  try {
+    const statusReport = await runStatus(runtimeOptions);
+    assert.equal(statusReport.embedderRunner.running, true);
+    assert.equal(statusReport.embedderRunner.backendIfQueriedNow, 'runner');
+
+    const doctorReport = await runDoctor(runtimeOptions);
+    const afterState = await loadState(config);
+
+    assert.equal(doctorReport.embedderRunner.running, true);
+    assert.equal(doctorReport.embedderRunner.selectedBackend, 'runner');
+    assert.equal(doctorReport.queryCheck.embedderRuntime.backend, 'runner');
+    assert.equal(doctorReport.consultCheck.embedderRuntime.backend, 'runner');
+    assert.equal(doctorReport.embedderPrewarm.outcome, 'skipped');
+    assert.equal(afterState.queryHistory.length, before.queryHistory.length);
+    assert.equal(afterState.memoryAdmission.usageEvents.length, before.memoryAdmission.usageEvents.length);
+  } finally {
+    await stopEmbedderRunner(config, { reason: 'test cleanup' });
+  }
 });
 
 test('vault validation flags deprecated project mirrors and legacy markers', async () => {
@@ -936,6 +1373,76 @@ test('state normalization removes legacy query references to deprecated vault su
     'brain:overview:/tmp/vault/01_Projects/brain/overview.md',
     'brain:knowledge:/tmp/vault/04_Knowledge_Base/documentation-style-patterns.md',
   ]);
+});
+
+test('recordMemoryUsage promotes repeated normalized-project hits into one candidate and suppresses canonical duplicates', () => {
+  const config = {
+    projectsRoot: '/tmp/projects',
+    vaultRoot: '/tmp/vault',
+    collectionName: 'brain_memory',
+    watchMode: 'auto',
+    pollIntervalMs: 60000,
+  };
+
+  const state = normalizeState(config, {});
+  const queryPhrases = [
+    'retry boundary placement',
+    'safe change retry wrapper',
+    'shared client retry logic',
+    'shared client timeout retries',
+  ];
+
+  for (const query of queryPhrases) {
+    recordMemoryUsage(state, {
+      source: 'query',
+      query,
+      currentProjectName: 'brain',
+      mode: 'local-only',
+      results: [
+        {
+          project: 'brain',
+          noteType: 'normalized-project',
+          sourcePath: '/tmp/projects/brain',
+          sourceKind: 'project',
+          snippet: 'Shared retry wrapper sits at the outbound client boundary.',
+          relevanceScore: 0.82,
+          evidenceQuality: 'strong',
+          confidence: 0.9,
+          supportCount: 1,
+        },
+        {
+          project: 'brain',
+          noteType: 'learnings',
+          sourcePath: '/tmp/vault/01_Projects/brain/learnings.md',
+          sourceKind: 'note',
+          snippet: 'Place retry behavior at the shared client boundary.',
+          relevanceScore: 0.8,
+          evidenceQuality: 'strong',
+          confidence: 0.88,
+          supportCount: 1,
+        },
+      ],
+    }, { config });
+  }
+
+  const summary = summarizeMemoryAdmission(state, config);
+  assert.equal(summary.candidateCount, 1);
+  assert.equal(summary.suppressedCanonicalCount, 1);
+  assert.equal(summary.suppressedDuplicateCount, 1);
+  assert.ok(summary.topCandidates[0].targetPath.endsWith(path.join('01_Projects', 'brain', 'learnings.md')));
+});
+
+test('getLastLearningActivityAt falls back to capture-learning operations when lastLearnAt is null', () => {
+  const state = normalizeState({ projectsRoot: '/tmp/projects' }, {});
+  state.operations = [
+    {
+      at: '2026-04-15T10:12:42.503Z',
+      type: 'capture-learning',
+      summary: 'Captured learning for brain: audit note',
+    },
+  ];
+
+  assert.equal(getLastLearningActivityAt(state), '2026-04-15T10:12:42.503Z');
 });
 
 test('cleanupDeprecatedVaultArtifacts only reports paths that actually existed', async () => {

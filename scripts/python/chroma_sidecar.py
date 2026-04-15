@@ -5,30 +5,63 @@ import sys
 from pathlib import Path
 
 
+try:
+    import chromadb  # type: ignore
+    CHROMADB_IMPORT_ERROR = None
+except Exception as error:  # pragma: no cover - surfaced in runtime response
+    chromadb = None
+    CHROMADB_IMPORT_ERROR = error
+
+
+_COLLECTION_CACHE = {}
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--server":
+        return run_server()
+
     action = sys.argv[1] if len(sys.argv) > 1 else "status"
     payload = json.loads(sys.stdin.read() or "{}")
+    response = execute_action(action, payload)
+    print(json.dumps(response))
+    return 0 if response.get("ok") else 1
 
-    try:
-        import chromadb  # type: ignore
-    except Exception as error:
-        response = {
+
+def run_server() -> int:
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        request_id = None
+        try:
+            message = json.loads(line)
+            request_id = message.get("id")
+            response = execute_action(message.get("action", "status"), message.get("payload") or {})
+        except Exception as error:  # pragma: no cover - defensive response path
+            response = {"ok": False, "error": str(error)}
+
+        if request_id is not None:
+            response["id"] = request_id
+        sys.stdout.write(f"{json.dumps(response)}\n")
+        sys.stdout.flush()
+
+    return 0
+
+
+def execute_action(action: str, payload: dict) -> dict:
+    if chromadb is None:
+        return {
             "ok": False,
             "available": False,
             "python": sys.version,
-            "error": f"chromadb is unavailable: {error}",
+            "error": f"chromadb is unavailable: {CHROMADB_IMPORT_ERROR}",
         }
-        print(json.dumps(response))
-        return 0 if action == "status" else 1
 
-    client = chromadb.PersistentClient(path=payload["path"])
-    collection = client.get_or_create_collection(
-        name=payload["collectionName"],
-        metadata={"hnsw:space": "cosine"},
-    )
+    collection = get_collection(payload)
 
     if action == "status":
-        response = {
+        return {
             "ok": True,
             "available": True,
             "python": sys.version,
@@ -36,12 +69,9 @@ def main() -> int:
             "path": str(Path(payload["path"]).resolve()),
             "count": collection.count(),
         }
-        print(json.dumps(response))
-        return 0
 
     if action == "ensure_collection":
-        print(json.dumps({"ok": True, "count": collection.count()}))
-        return 0
+        return {"ok": True, "count": collection.count()}
 
     if action == "upsert":
         collection.upsert(
@@ -50,8 +80,7 @@ def main() -> int:
             embeddings=payload["embeddings"],
             metadatas=payload["metadatas"],
         )
-        print(json.dumps({"ok": True, "upsertedCount": len(payload["ids"])}))
-        return 0
+        return {"ok": True, "upsertedCount": len(payload["ids"])}
 
     if action == "query":
         results = collection.query(
@@ -74,18 +103,30 @@ def main() -> int:
                     "distance": distances[index] if index < len(distances) else 1,
                 }
             )
-        print(json.dumps({"ok": True, "results": flattened}))
-        return 0
+        return {"ok": True, "results": flattened}
 
     if action == "delete_ids":
         ids = payload.get("ids", [])
         if ids:
             collection.delete(ids=ids)
-        print(json.dumps({"ok": True, "deletedCount": len(ids)}))
-        return 0
+        return {"ok": True, "deletedCount": len(ids)}
 
-    print(json.dumps({"ok": False, "error": f"Unknown action: {action}"}))
-    return 1
+    return {"ok": False, "error": f"Unknown action: {action}"}
+
+
+def get_collection(payload: dict):
+    cache_key = (payload["path"], payload["collectionName"])
+    cached = _COLLECTION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    client = chromadb.PersistentClient(path=payload["path"])
+    collection = client.get_or_create_collection(
+        name=payload["collectionName"],
+        metadata={"hnsw:space": "cosine"},
+    )
+    _COLLECTION_CACHE[cache_key] = collection
+    return collection
 
 
 if __name__ == "__main__":

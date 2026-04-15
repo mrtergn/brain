@@ -8,6 +8,7 @@ This file shows what good output looks like from Brain's local retrieval and res
 | --- | --- |
 | `mode` | Tells the operator or agent whether the answer should stay local or escalate to web validation |
 | `localConfidence` | Explains how strong the local memory signal really is |
+| `decisionTrace` | Shows why Brain stayed local or escalated instead of hiding the routing logic |
 | `topResults` | Shows which projects and note types drove the answer |
 | `researchDecision` | Makes the escalation rule explicit instead of implicit |
 | `memoryGuidance` | Tells you whether the result should stay ephemeral, become a candidate, or become durable memory |
@@ -87,7 +88,7 @@ This file shows what good output looks like from Brain's local retrieval and res
 **Expected flow**
 
 1. `brain.consult` checks local auth and session patterns first.
-2. The returned mode recommends Tier 1 research.
+2. The returned mode includes a decision score and escalation drivers, then recommends Tier 1 research.
 3. External findings are gathered from official or standards-backed sources.
 4. `brain.synthesize_guidance` adapts those findings back into the current repo.
 5. If the result is promising but not yet implementation-proven, it becomes a research candidate instead of durable memory.
@@ -129,10 +130,15 @@ Query history is not just raw prompt text. Consultation records include high-sig
 
 - the query text
 - returned mode
+- decision score and escalation trace
 - related projects
 - top result identifiers
 - `webResearchRecommended`
 - `localConfidence`
+
+Runtime-only operations such as managed embedder prewarm, doctor latency diagnostics, and MCP startup readiness stay in `data/state/brain-state.json` rather than in `query-history.md`.
+
+Those operational events also do not count as usage-backed admission signals and never write project notes into the vault.
 
 That makes `query-history.md` useful as an operator trace instead of a meaningless transcript.
 

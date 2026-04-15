@@ -9,6 +9,10 @@ const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_FILE_NAME = 'brain.config.json';
 const DEFAULT_STATE_FILE_NAME = 'brain-state.json';
 const DEFAULT_COLLECTION_NAME = 'brain_memory';
+const DEFAULT_EMBEDDER_PREWARM_TIMEOUT_MS = 12000;
+const DEFAULT_EMBEDDER_RUNNER_STARTUP_TIMEOUT_MS = 15000;
+const DEFAULT_EMBEDDER_RUNNER_REQUEST_TIMEOUT_MS = 30000;
+const DEFAULT_EMBEDDER_RUNNER_IDLE_TIMEOUT_MS = 600000;
 
 export const BRAIN_ROOT = path.resolve(moduleDirectory, '..', '..');
 export const DEFAULT_PATHS = buildDefaultPaths();
@@ -325,6 +329,48 @@ export function buildRuntimeConfig(args = {}) {
     configValue: localConfig.data.topK,
     fallback: 6,
   }), 6);
+  const embedderPrewarm = resolveStringSetting(resolveSetting(args, {
+    argKeys: ['embedderPrewarm', 'embedder-prewarm'],
+    envKeys: ['BRAIN_EMBEDDER_PREWARM'],
+    configValue: localConfig.data.embedderPrewarm,
+    fallback: 'auto',
+  }));
+  const embedderPrewarmTimeoutMs = resolveNumberSetting(resolveSetting(args, {
+    argKeys: ['embedderPrewarmTimeoutMs', 'embedder-prewarm-timeout-ms'],
+    envKeys: ['BRAIN_EMBEDDER_PREWARM_TIMEOUT_MS'],
+    configValue: localConfig.data.embedderPrewarmTimeoutMs,
+    fallback: DEFAULT_EMBEDDER_PREWARM_TIMEOUT_MS,
+  }), DEFAULT_EMBEDDER_PREWARM_TIMEOUT_MS);
+  const embedderRunnerMode = resolveStringSetting(resolveSetting(args, {
+    argKeys: ['embedderRunnerMode', 'embedder-runner-mode'],
+    envKeys: ['BRAIN_EMBEDDER_RUNNER_MODE'],
+    configValue: localConfig.data.embedderRunnerMode,
+    fallback: 'auto',
+  }));
+  const embedderRunnerStartupTimeoutMs = resolveNumberSetting(resolveSetting(args, {
+    argKeys: ['embedderRunnerStartupTimeoutMs', 'embedder-runner-startup-timeout-ms'],
+    envKeys: ['BRAIN_EMBEDDER_RUNNER_STARTUP_TIMEOUT_MS'],
+    configValue: localConfig.data.embedderRunnerStartupTimeoutMs,
+    fallback: DEFAULT_EMBEDDER_RUNNER_STARTUP_TIMEOUT_MS,
+  }), DEFAULT_EMBEDDER_RUNNER_STARTUP_TIMEOUT_MS);
+  const embedderRunnerRequestTimeoutMs = resolveNumberSetting(resolveSetting(args, {
+    argKeys: ['embedderRunnerRequestTimeoutMs', 'embedder-runner-request-timeout-ms'],
+    envKeys: ['BRAIN_EMBEDDER_RUNNER_REQUEST_TIMEOUT_MS'],
+    configValue: localConfig.data.embedderRunnerRequestTimeoutMs,
+    fallback: DEFAULT_EMBEDDER_RUNNER_REQUEST_TIMEOUT_MS,
+  }), DEFAULT_EMBEDDER_RUNNER_REQUEST_TIMEOUT_MS);
+  const embedderRunnerIdleTimeoutMs = resolveNumberSetting(resolveSetting(args, {
+    argKeys: ['embedderRunnerIdleTimeoutMs', 'embedder-runner-idle-timeout-ms'],
+    envKeys: ['BRAIN_EMBEDDER_RUNNER_IDLE_TIMEOUT_MS'],
+    configValue: localConfig.data.embedderRunnerIdleTimeoutMs,
+    fallback: DEFAULT_EMBEDDER_RUNNER_IDLE_TIMEOUT_MS,
+  }), DEFAULT_EMBEDDER_RUNNER_IDLE_TIMEOUT_MS);
+  const embedderRunnerSocketPath = resolvePathSetting(resolveSetting(args, {
+    argKeys: ['embedderRunnerSocketPath', 'embedder-runner-socket-path'],
+    envKeys: ['BRAIN_EMBEDDER_RUNNER_SOCKET_PATH'],
+    configValue: localConfig.data.embedderRunnerSocketPath,
+    fallback: buildDefaultEmbedderRunnerSocketPath(runtimeRoot),
+  }), configDir);
   const runtimeScriptPath = path.join(BRAIN_ROOT, 'apps', 'cli', 'index.mjs');
 
   return {
@@ -367,6 +413,18 @@ export function buildRuntimeConfig(args = {}) {
     }), false),
     topK,
     pythonExecutable,
+    embedderPrewarm,
+    embedderPrewarmTimeoutMs,
+    embedderRunnerMode,
+    embedderRunnerStartupTimeoutMs,
+    embedderRunnerRequestTimeoutMs,
+    embedderRunnerIdleTimeoutMs,
+    embedderRunnerSocketPath,
+    embedderRunnerPidPath: path.join(runtimeRoot, 'brain-embedder-runner.pid'),
+    embedderRunnerStatePath: path.join(runtimeRoot, 'brain-embedder-runner.state.json'),
+    embedderRunnerLockPath: path.join(runtimeRoot, 'brain-embedder-runner.lock'),
+    embedderRunnerStdoutLogPath: path.join(logRoot, 'brain-embedder-runner.stdout.log'),
+    embedderRunnerStderrLogPath: path.join(logRoot, 'brain-embedder-runner.stderr.log'),
     localReasonerOnly: resolveBooleanSetting(resolveSetting(args, {
       argKeys: ['localReasonerOnly', 'local-reasoner-only'],
       envKeys: ['BRAIN_LOCAL_REASONER_ONLY'],
@@ -507,6 +565,14 @@ function resolvePathSetting(setting, configDir) {
   return resolvePathFromBase(String(setting.value), basePath);
 }
 
+function buildDefaultEmbedderRunnerSocketPath(runtimeRoot) {
+  const localCandidate = path.join(runtimeRoot, 'brain-er.sock');
+  if (localCandidate.length <= 92) {
+    return localCandidate;
+  }
+  return path.join(os.tmpdir(), `brain-er-${sha256(runtimeRoot).slice(0, 12)}.sock`);
+}
+
 function resolveExecutableSetting(setting, configDir) {
   const rawValue = String(setting.value).trim();
   if (!looksLikePath(rawValue)) {
@@ -545,7 +611,7 @@ function resolveBooleanSetting(setting, fallbackValue) {
   return fallbackValue;
 }
 
-function resolvePathFromBase(rawValue, basePath) {
+export function resolvePathFromBase(rawValue, basePath) {
   const expandedValue = expandHomeDirectory(rawValue);
   return path.isAbsolute(expandedValue)
     ? path.resolve(expandedValue)

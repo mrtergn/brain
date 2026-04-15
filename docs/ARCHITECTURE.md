@@ -80,8 +80,8 @@ flowchart LR
 | `packages/provenance/index.mjs` | Shared evidence model, trust scoring, source normalization, and metadata parsing |
 | `packages/obsidian-writer/canonical-writer.mjs` | Only active note writer and vault bootstrap path |
 | `packages/vault-contract/index.mjs` | Canonical note paths, cleanup rules, and validation logic |
-| `packages/vector-store/index.mjs` | Local Chroma integration |
-| `packages/state-manager/index.mjs` | Runtime state and query-history persistence |
+| `packages/vector-store/index.mjs` | Local Chroma integration with a shared in-process Python sidecar for repeated queries |
+| `packages/state-manager/index.mjs` | Runtime state, query-history persistence, and local usage-backed memory-admission tracking |
 
 ## Canonical Vault Contract
 
@@ -200,6 +200,16 @@ sequenceDiagram
 
 `brain.query` and `brain.consult` share the same local retrieval foundation. The difference is that `brain.consult` adds research mode selection, source prioritization, trust summarization, and memory guidance so agents know whether they should stay local or pull in external validation. Documentation-shaped queries can also reuse cross-project documentation patterns when Brain detects that the task is about repo presentation, architecture docs, operator docs, or agent guidance.
 
+Inside that shared retrieval foundation, Brain now does more than semantic nearest-neighbor lookup. Query expansion still broadens short or messy prompts, but the final ranking now also weighs direct phrase matches, repo-specific intent, boundary/debugging/documentation cues, evidence quality, support traces, and confidence. The selection step still enforces diversity across note surfaces, but the final result list is re-sorted by final relevance so the operator surface remains coherent.
+
+Managed embedder prewarm now sits directly in front of that retrieval path. Each Node.js runtime owns at most one shared Python embedder service, and the JavaScript side waits for an explicit startup handshake after the model is actually loaded. In the default `auto` mode, `brain:mcp` and `brain:doctor` block on that readiness once so the long-lived or multi-step paths expose cold-start cost up front. `brain:embed`, `brain:query`, and `brain:consult` start the same prewarm in the background so short-lived commands can overlap model load with other work. `brain:status` and `brain:mcp:healthcheck` skip prewarm so they remain lightweight and do not retain helper processes unnecessarily.
+
+Those prewarm summaries are runtime operations, not knowledge artifacts. They are written into local state for status and doctor reporting, but they do not become query history, they do not count as usage-backed admission signals, and they never write project notes into the vault.
+
+Cross-process CLI reuse is handled by a separate ownership layer: a Node-owned persistent embedder runner that serves local embedding requests over a Unix socket. Its PID, lock, and state files stay under `data/runtime/` and `data/state/`, it has explicit `start`, `status`, `restart`, and `stop` commands, and it performs stale PID and lock cleanup before claiming ownership. In `auto` mode, `brain:query` and `brain:consult` can start it on demand and later fresh CLI processes reuse it. In `require` mode, those commands fail clearly if the runner cannot become healthy. `brain:doctor` inspects and reports this runner but only uses it when it is already healthy or the operator required it.
+
+The MCP server stays separate from that CLI runner. MCP keeps its own explicit startup prewarm inside the MCP-owned process rather than silently attaching to the CLI runner. That preserves the boundary between one-shot CLI ownership and long-lived MCP ownership.
+
 ## Local-First and Web-Assisted Model
 
 | Mode | When it is appropriate | Expected behavior |
@@ -233,13 +243,15 @@ The intended agent sequence is:
 
 `brain.search` remains important, but it is the retrieval debugger rather than the preferred first step for non-trivial work.
 
+`brain.consult` now also exposes a decision trace: a scored breakdown of why the runtime stayed local, recommended local-plus-web assist, or escalated to web-first-local-adaptation. That makes consultation behavior inspectable instead of leaving it buried inside boolean gates.
+
 ## Validation and Anti-Drift Protections
 
 | Guardrail | What it checks |
 | --- | --- |
 | `brain:validate:vault` | Unexpected project note files, legacy markers, per-project knowledge mirrors, per-project logs, and runtime artifacts in the vault |
-| `brain:doctor` | Vault validity, knowledge model version mismatches, deprecated retrieval surfaces in chunk cache, missing embeddings, provenance-aware query smoke results, consult trust-summary behavior, and MCP tool availability |
-| `brain:mcp:healthcheck` | Whether the MCP server starts cleanly and exposes the expected `brain.*` tool surface |
+| `brain:doctor` | Vault validity, knowledge model version mismatches, deprecated retrieval surfaces in chunk cache, missing embeddings, managed embedder prewarm readiness, provenance-aware query smoke results, consult decision-trace behavior, project-level retrieval precision, citation completeness, usage-backed admission counters, retrieval latency warnings, and MCP tool availability |
+| `brain:mcp:healthcheck` | Whether the MCP server starts cleanly and exposes the expected `brain.*` tool surface without keeping a long-lived MCP or embedder helper alive |
 
 The anti-drift model is explicit: remove deprecated artifacts before they survive into retrieval, then run smoke tests that prove the runtime still behaves the way the docs describe.
 
@@ -257,6 +269,19 @@ Default locations are intentionally local and portable:
 - projects root: parent directory of the Brain repository
 - vault root: `~/Obsidian/Brain` when present, otherwise `./obsidian-sync`
 - data root: `./data`
+
+Runtime behavior also exposes two embedder-specific knobs across CLI, environment, and config file resolution:
+
+- `embedderPrewarm` or `BRAIN_EMBEDDER_PREWARM`: `auto`, `blocking`, `background`, or `off`
+- `embedderPrewarmTimeoutMs` or `BRAIN_EMBEDDER_PREWARM_TIMEOUT_MS`: timeout budget for managed prewarm, default `12000`
+
+Persistent runner configuration is resolved through the same precedence chain:
+
+- `embedderRunnerMode` or `BRAIN_EMBEDDER_RUNNER_MODE`: `off`, `auto`, or `require`
+- `embedderRunnerStartupTimeoutMs` or `BRAIN_EMBEDDER_RUNNER_STARTUP_TIMEOUT_MS`: wait budget while a runner becomes healthy
+- `embedderRunnerRequestTimeoutMs` or `BRAIN_EMBEDDER_RUNNER_REQUEST_TIMEOUT_MS`: timeout for one request sent through the runner
+- `embedderRunnerIdleTimeoutMs` or `BRAIN_EMBEDDER_RUNNER_IDLE_TIMEOUT_MS`: idle shutdown timer for the runner, `0` to disable idle shutdown
+- `embedderRunnerSocketPath` or `BRAIN_EMBEDDER_RUNNER_SOCKET_PATH`: explicit socket override when the default path is not appropriate
 
 ## Secondary Surfaces
 

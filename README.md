@@ -138,8 +138,8 @@ Brain now treats durable memory as something it must justify, not just retrieve.
 
 - Analysis extracts provenance-backed boundary rules, validation surfaces, reusable solutions, and documentation patterns from real repo evidence.
 - Normalization and chunking preserve `provenance-v1`, confidence, evidence quality, support count, and supporting source traces instead of flattening everything into plain strings.
-- `brain:query` now explains both why a result matched and why it is trustworthy.
-- `brain:consult` now returns a trust summary, local evidence basis, and clearer reasons when external guidance is still required.
+- `brain:query` now reranks by semantic similarity, lexical coverage, query intent, evidence quality, confidence, and support traces, then explains both why a result matched and why it is trustworthy.
+- `brain:consult` now returns a decision score, factor trace, trust summary, local evidence basis, and clearer reasons when external guidance is still required.
 - The canonical writer surfaces provenance selectively through confidence and evidence lines in learnings and documentation-style patterns without dumping raw metadata into the vault.
 
 ## Consultation Flow
@@ -182,12 +182,31 @@ What each stage does:
 - `brain:init` creates runtime folders, vault scaffolding, and launcher scripts under `data/runtime/`.
 - `brain:sync` refreshes canonical project notes and managed global notes, including cross-project documentation-style patterns.
 - `brain:validate:vault` fails if legacy markers, project logs, knowledge mirrors, or runtime artifacts reappear in the vault.
-- `brain:doctor` checks vault integrity, retrieval readiness, consultation behavior, and MCP health.
+- `brain:doctor` checks vault integrity, retrieval readiness, consultation behavior, project-level retrieval diagnostics, usage-backed memory-admission state, managed embedder prewarm readiness, latency warnings, and MCP health.
 - `brain:doctor`, `brain:query`, and `brain:consult` now also verify that the runtime can expose trust-aware evidence fields instead of returning opaque matches.
-- `brain:embed` rebuilds the local semantic index.
+- Retrieval now reuses a shared local Chroma sidecar inside each process, so repeated searches stop paying Python startup on every vector-store call.
+- `brain:embed` rebuilds the local semantic index and can start managed embedder prewarm inside the worker process.
 - `brain:consult` is the primary guidance entrypoint.
 - `brain:query` is the lower-level retrieval debugger.
-- `brain:mcp` starts the `local-brain` MCP server.
+- `brain:status` now shows local usage-backed admission counters, derived learning activity, and the latest embedder prewarm summary in addition to runtime paths and timestamps.
+- One-shot CLI retrieval can also reuse a dedicated persistent local embedder runner through `brain:runner:start`, `brain:runner:status`, `brain:runner:restart`, and `brain:runner:stop`.
+- `brain:mcp` starts the `local-brain` MCP server and, in the default `auto` mode, blocks on embedder readiness once at startup so later agent requests do not pay the first model-load hit.
+
+Managed embedder prewarm is intentional rather than hidden:
+
+- `auto` blocks during `brain:mcp` and `brain:doctor`.
+- `auto` starts background prewarm during `brain:embed`, `brain:query`, and `brain:consult`.
+- `brain:status` and `brain:mcp:healthcheck` stay lightweight and do not keep helper processes alive.
+- Prewarm state is recorded under `data/state/` only. It does not create query-history entries, increment usage-backed admission counters, or write vault notes.
+- Override the behavior with `--embedder-prewarm`, `--embedder-prewarm-timeout-ms`, `BRAIN_EMBEDDER_PREWARM`, or `BRAIN_EMBEDDER_PREWARM_TIMEOUT_MS`.
+
+Persistent CLI embedder reuse is explicit rather than hidden:
+
+- `brain:query` and `brain:consult` use the runner in `auto` mode when it is already healthy, or they start it on demand and reuse it across later fresh CLI processes.
+- `brain:doctor` reports runner health and uses the runner only when it is already healthy or the mode is `require`; otherwise it falls back to the in-process embedder path.
+- `brain:runner:start`, `brain:runner:status`, `brain:runner:restart`, and `brain:runner:stop` expose clear operator ownership for the runner lifecycle.
+- Runner lifecycle state stays local under `data/runtime/` and `data/state/`; it does not create query-history entries, usage-backed admission events, or vault notes.
+- Override selection and timing with `--embedder-runner-mode`, `--embedder-runner-startup-timeout-ms`, `--embedder-runner-request-timeout-ms`, `--embedder-runner-idle-timeout-ms`, `--embedder-runner-socket-path`, or the matching `BRAIN_EMBEDDER_RUNNER_*` environment variables.
 
 ## Repo Layout
 

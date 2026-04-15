@@ -17,7 +17,10 @@ import {
   searchBrain,
   synthesizeGuidance,
 } from '../../packages/brain-service/index.mjs';
+import { prewarmEmbeddingService, shutdownEmbeddingService } from '../../packages/embeddings/index.mjs';
+import { loadState, recordOperation, saveState } from '../../packages/state-manager/index.mjs';
 import { appendLog, buildLogPath, buildRuntimeConfig, parseArgs } from '../../packages/shared/index.mjs';
+import { shutdownChromaService } from '../../packages/vector-store/index.mjs';
 
 export const BRAIN_MCP_TOOL_NAMES = [
   'brain.search',
@@ -83,6 +86,28 @@ server.registerTool('brain.search', {
       solutionSuggestions: z.array(z.string()),
       improvementRecommendations: z.array(z.string()),
     }),
+    memoryAdmission: z.object({
+      recorded: z.boolean(),
+      queryFingerprint: z.string(),
+      usageEventCount: z.number(),
+      trackedResultCount: z.number(),
+      candidateCount: z.number(),
+      suppressedCanonicalCount: z.number(),
+      suppressedDuplicateCount: z.number(),
+      touchedCandidates: z.array(z.object({
+        id: z.string(),
+        project: z.string(),
+        noteType: z.string(),
+        sourcePath: z.string(),
+        score: z.number(),
+        useCount: z.number(),
+        distinctQueryCount: z.number(),
+        targetType: z.string(),
+        targetProjectName: z.string().nullable(),
+        targetPath: z.string().nullable(),
+        summary: z.string(),
+      })),
+    }),
     relatedPatterns: z.array(z.object({
       patternTitle: z.string(),
       explanation: z.string(),
@@ -132,6 +157,20 @@ server.registerTool('brain.consult', {
     currentProjectName: z.string().nullable(),
     currentProjectPath: z.string().nullable(),
     mode: z.enum(['local-only', 'local-plus-web-assist', 'web-first-local-adaptation']),
+    decisionTrace: z.object({
+      score: z.number(),
+      thresholds: z.object({
+        localPlusWebAssist: z.number(),
+        webFirstLocalAdaptation: z.number(),
+      }),
+      contributions: z.array(z.object({
+        factor: z.string(),
+        weight: z.number(),
+        reason: z.string(),
+      })),
+      primaryDrivers: z.array(z.string()),
+      stabilizers: z.array(z.string()),
+    }),
     localConfidence: z.object({
       score: z.number(),
       level: z.enum(['low', 'medium', 'high']),
@@ -182,6 +221,28 @@ server.registerTool('brain.consult', {
       writeBackRecommended: z.boolean(),
       writeBackTarget: z.string(),
       rationale: z.array(z.string()),
+    }),
+    memoryAdmission: z.object({
+      recorded: z.boolean(),
+      queryFingerprint: z.string(),
+      usageEventCount: z.number(),
+      trackedResultCount: z.number(),
+      candidateCount: z.number(),
+      suppressedCanonicalCount: z.number(),
+      suppressedDuplicateCount: z.number(),
+      touchedCandidates: z.array(z.object({
+        id: z.string(),
+        project: z.string(),
+        noteType: z.string(),
+        sourcePath: z.string(),
+        score: z.number(),
+        useCount: z.number(),
+        distinctQueryCount: z.number(),
+        targetType: z.string(),
+        targetProjectName: z.string().nullable(),
+        targetPath: z.string().nullable(),
+        summary: z.string(),
+      })),
     }),
     trustSummary: z.object({
       localEvidenceQuality: z.enum(['weak', 'medium', 'strong']),
@@ -689,9 +750,91 @@ async function main(argv = process.argv.slice(2)) {
     return;
   }
 
-  await appendLog(buildLogPath(config, 'brain-mcp.log'), `Starting local-brain MCP server | vault=${config.vaultRoot} | data=${config.dataRoot}`);
+  const embedderPrewarm = await startMcpEmbedderPrewarm(config);
+  await recordMcpEmbedderPrewarm(config, embedderPrewarm);
+  await appendLog(buildLogPath(config, 'brain-mcp.log'), `Starting local-brain MCP server | vault=${config.vaultRoot} | data=${config.dataRoot} | embedder-prewarm=${embedderPrewarm.outcome}`);
+  installShutdownHandlers(config);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
+
+async function startMcpEmbedderPrewarm(config) {
+  const configuredMode = String(config.embedderPrewarm ?? 'auto').trim().toLowerCase();
+  if (['off', 'false', 'disabled', 'none'].includes(configuredMode)) {
+    return buildSkippedPrewarm(config, 'disabled by configuration');
+  }
+  if (configuredMode === 'background') {
+    prewarmEmbeddingService({
+      pythonExecutable: config.pythonExecutable,
+      timeoutMs: config.embedderPrewarmTimeoutMs,
+      reason: 'mcp-startup',
+      strategy: 'background',
+    }).catch(() => {});
+    return buildSkippedPrewarm(config, 'background prewarm started asynchronously');
+  }
+  return prewarmEmbeddingService({
+    pythonExecutable: config.pythonExecutable,
+    timeoutMs: config.embedderPrewarmTimeoutMs,
+    reason: 'mcp-startup',
+    strategy: 'blocking',
+  });
+}
+
+function buildSkippedPrewarm(config, detail) {
+  return {
+    at: new Date().toISOString(),
+    outcome: 'skipped',
+    reason: 'mcp-startup',
+    strategy: 'skipped',
+    timeoutMs: config.embedderPrewarmTimeoutMs,
+    durationMs: 0,
+    servicePid: null,
+    pythonExecutable: config.pythonExecutable,
+    error: detail,
+  };
+}
+
+async function recordMcpEmbedderPrewarm(config, embedderPrewarm) {
+  if (!embedderPrewarm || embedderPrewarm.outcome === 'skipped') {
+    return;
+  }
+  const state = await loadState(config);
+  recordOperation(state, 'embedder-prewarm', {
+    outcome: embedderPrewarm.outcome,
+    reason: embedderPrewarm.reason,
+    strategy: embedderPrewarm.strategy,
+    durationMs: embedderPrewarm.durationMs,
+    timeoutMs: embedderPrewarm.timeoutMs,
+    servicePid: embedderPrewarm.servicePid,
+    pythonExecutable: embedderPrewarm.pythonExecutable,
+    error: embedderPrewarm.error,
+    summary: `Embedder prewarm ${embedderPrewarm.outcome} for mcp-startup (${embedderPrewarm.durationMs}ms)`,
+  });
+  await saveState(config, state);
+}
+
+function installShutdownHandlers(config) {
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    await appendLog(buildLogPath(config, 'brain-mcp.log'), `Stopping local-brain MCP server via ${signal}`);
+    await shutdownEmbeddingService();
+    await shutdownChromaService();
+    process.exit(0);
+  };
+
+  process.once('SIGINT', () => {
+    shutdown('SIGINT');
+  });
+  process.once('SIGTERM', () => {
+    shutdown('SIGTERM');
+  });
+  process.once('SIGHUP', () => {
+    shutdown('SIGHUP');
+  });
 }
 
 function renderSearchText(payload) {
@@ -713,6 +856,13 @@ function renderSearchText(payload) {
       lines.push(`- ${pattern.patternTitle} | projects: ${pattern.sourceProjects.join(', ')}`);
     }
   }
+  if (payload.memoryAdmission?.touchedCandidates?.length > 0) {
+    lines.push('');
+    lines.push('Memory admission candidates:');
+    for (const candidate of payload.memoryAdmission.touchedCandidates.slice(0, 3)) {
+      lines.push(`- ${candidate.project}/${candidate.noteType} -> ${candidate.targetPath ?? candidate.targetType} | score=${candidate.score}`);
+    }
+  }
   return lines.join('\n');
 }
 
@@ -720,6 +870,7 @@ function renderConsultationText(payload) {
   const lines = [
     `Brain consultation for: ${payload.query}`,
     `Mode: ${payload.mode}`,
+    `Decision score: ${payload.decisionTrace.score} (web assist >= ${payload.decisionTrace.thresholds.localPlusWebAssist}, web first >= ${payload.decisionTrace.thresholds.webFirstLocalAdaptation})`,
     `Local confidence: ${payload.localConfidence.score} (${payload.localConfidence.level})`,
     `Web research required: ${payload.researchDecision.needsWebResearch ? 'yes' : 'no'}`,
     '',
@@ -745,6 +896,20 @@ function renderConsultationText(payload) {
     lines.push('Prioritize these sources:');
     for (const source of payload.researchPlan.sourceTargets.slice(0, 4)) {
       lines.push(`- ${source.tier} | ${source.label}`);
+    }
+  }
+  if (payload.decisionTrace.primaryDrivers.length > 0) {
+    lines.push('');
+    lines.push('Escalation drivers:');
+    for (const driver of payload.decisionTrace.primaryDrivers.slice(0, 3)) {
+      lines.push(`- ${driver}`);
+    }
+  }
+  if (payload.memoryAdmission?.touchedCandidates?.length > 0) {
+    lines.push('');
+    lines.push('Memory admission candidates:');
+    for (const candidate of payload.memoryAdmission.touchedCandidates.slice(0, 3)) {
+      lines.push(`- ${candidate.project}/${candidate.noteType} -> ${candidate.targetPath ?? candidate.targetType} | score=${candidate.score}`);
     }
   }
   lines.push('');
@@ -817,6 +982,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === currentFilePath) {
   main().catch(async (error) => {
     const config = buildRuntimeConfig();
     await appendLog(buildLogPath(config, 'brain-mcp.log'), `MCP server failed: ${error.message}`);
+    await shutdownEmbeddingService();
+    await shutdownChromaService();
     console.error(error.message);
     process.exitCode = 1;
   });

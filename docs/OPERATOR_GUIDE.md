@@ -68,11 +68,42 @@ npm run brain:consult -- --project brain "safe extension point for MCP changes"
 The system is healthy when all of the following are true:
 
 - `npm run brain:status` shows the expected paths and non-null `Last sync` and `Last embed` values.
+- `npm run brain:status` also shows usage-event, tracked-result, and promotion-candidate counts for the local admission loop, a derived `Last learn` timestamp, and the latest embedder prewarm summary.
+- `npm run brain:runner:status` reports either a clean stopped state or a running PID/model pair, never an unexplained zombie helper.
 - `npm run brain:validate:vault` passes with no unexpected project notes, knowledge mirrors, marker sections, or runtime artifacts.
 - `npm run brain:doctor` passes and reports MCP as healthy.
 - `npm run brain:query -- "reusable pattern"` returns canonical note surfaces rather than deprecated ones, and the top result includes both matched and trusted reasons.
+- `npm run brain:doctor` reports usable retrieval diagnostics such as current-project recall, citation coverage, a dedicated embedder-prewarm line, warmed retrieval latency, and usage-backed admission counters instead of only generic smoke success.
+- A second fresh `brain:query` or `brain:consult` run is materially faster after the runner is already up, because the one-shot CLI process reused the persistent local embedder instead of reloading the model again.
 - documentation-oriented retrieval returns strong README, architecture, operator-guide, or agent-instruction surfaces instead of generic markdown matches.
-- `npm run brain:consult -- "best practice for token refresh handling"` recommends web research for that current auth best-practice query and prints a local trust basis before escalation.
+- `npm run brain:consult -- "best practice for token refresh handling"` recommends web research for that current auth best-practice query, prints a local trust basis, and shows the decision score that triggered escalation.
+- `npm run brain:mcp:healthcheck` returns quickly and does not leave an idle MCP, embedder, or Chroma helper process behind.
+
+## Managed Embedder Prewarm
+
+Brain now treats embedder cold-start as a managed runtime concern instead of letting the first real request discover it implicitly.
+
+- The default `auto` mode blocks during `brain:mcp` startup and `brain:doctor` so those long-lived or multi-step paths expose model-load cost once.
+- The same `auto` mode starts background prewarm during `brain:embed`, `brain:query`, and `brain:consult`, which overlaps startup with other work but still leaves one-shot cold commands paying most of the model-load wall time.
+- `brain:status` and `brain:mcp:healthcheck` skip prewarm so they stay cheap and non-persistent.
+- On the current validation machine, embedder prewarm settled at about `6.5s`, post-prewarm query smoke at about `615ms`, and warmed retrieval diagnostics at about `20ms`.
+- Override behavior with `--embedder-prewarm` or `BRAIN_EMBEDDER_PREWARM` using `auto`, `blocking`, `background`, or `off`.
+- Tune the startup budget with `--embedder-prewarm-timeout-ms` or `BRAIN_EMBEDDER_PREWARM_TIMEOUT_MS`.
+- Prewarm summaries are runtime-only. They do not add query-history entries, promotion candidates, or vault notes.
+
+## Persistent CLI Embedder Runner
+
+Brain now also exposes an explicitly owned persistent local embedder runner for one-shot CLI use.
+
+- `npm run brain:runner:start` starts the runner and waits until it is healthy.
+- `npm run brain:runner:status` reports whether the runner is stopped, stale, or running, along with the PID and model details when available.
+- `npm run brain:runner:restart` rotates the runner cleanly if you need to reset ownership or recover from a bad state.
+- `npm run brain:runner:stop` stops the runner and its owned embedder child without touching the MCP-owned helpers.
+- In the default `auto` mode, `brain:query` and `brain:consult` will start the runner on demand and later fresh CLI processes will reuse it.
+- In `require` mode, `brain:query`, `brain:consult`, and runner-aware diagnostics fail clearly instead of silently falling back to the in-process embedder.
+- `brain:doctor` reports the runner state and uses it only when it is already healthy or required. Otherwise it keeps the conservative in-process path.
+- Override runner behavior with `--embedder-runner-mode`, `--embedder-runner-startup-timeout-ms`, `--embedder-runner-request-timeout-ms`, `--embedder-runner-idle-timeout-ms`, `--embedder-runner-socket-path`, or the matching `BRAIN_EMBEDDER_RUNNER_*` environment variables.
+- Runner state is operational only. It does not create query-history rows, usage-backed admission events, or vault notes.
 
 ## What Doctor Actually Checks
 
@@ -82,8 +113,12 @@ The system is healthy when all of the following are true:
 - knowledge-model version mismatches in embedded project state
 - deprecated retrieval surfaces that still exist in chunk cache
 - missing embeddings and empty indexed-project state
+- managed embedder prewarm readiness and timeout/failure reporting before warm retrieval smoke runs
 - query smoke results for a realistic retrieval prompt
-- consultation behavior for a current auth best-practice prompt
+- consultation behavior for a current auth best-practice prompt, including decision score and escalation trace
+- project-level retrieval diagnostics derived from real indexed project signals
+- current-project precision, citation coverage, strong-evidence rate, and retrieval latency
+- local usage-backed admission counters so repeated useful snapshot hits can be reviewed before write-back
 - provenance-aware trust fields on query results and consult responses
 - MCP health and the presence of the expected `brain.*` tools
 
@@ -96,7 +131,11 @@ If `doctor` fails, treat it as a runtime readiness problem, not just a documenta
 | `status` shows no indexed projects | Sync and embed have not run yet | Run `npm run brain:sync` then `npm run brain:embed` |
 | `validate:vault` reports unexpected project files | Deprecated notes or runtime files leaked into the vault | Remove the offending files or rerun `npm run brain:sync`, then validate again |
 | `doctor` reports deprecated retrieval surfaces | Old chunk data still references removed note models | Run `npm run brain:sync` then `npm run brain:embed -- --force` |
+| The first cold `query` or `consult` is much slower than later ones | The Python embedder is still loading the sentence-transformer model | Prefer the long-lived `npm run brain:mcp` flow for daily agent work, or let `brain:doctor` pay the blocking prewarm first |
+| `brain:runner:status` shows `stale` | A previous runner left a dead PID, missing socket, or orphaned lock | Run `npm run brain:runner:stop`, then `npm run brain:runner:start`; if it persists, inspect `data/logs/brain-embedder-runner.stderr.log` |
+| `status` shows the latest embedder prewarm as failed or timed out | Python runtime drift, missing packages, or the model load exceeded the timeout budget | Run `npm run brain:doctor`, inspect `data/logs/brain.log` or `data/logs/brain-mcp.log`, rerun `npm run brain:bootstrap:python`, and increase `--embedder-prewarm-timeout-ms` only if the environment is otherwise healthy |
 | MCP healthcheck fails or tools are missing | MCP entrypoint or launcher drifted | Run `npm run brain:init`, then `npm run brain:mcp:healthcheck`, and inspect `data/logs/brain-mcp.log` |
+| An MCP session looks stale after a terminal closes | A detached `brain:mcp` process or helper child is still running | Run `pkill -TERM -f 'apps/mcp-server/index.mjs'`, then `pkill -TERM -f 'scripts/python/embedder.py --server'`, then `pkill -TERM -f 'scripts/python/chroma_sidecar.py --server'`, and restart `npm run brain:mcp` |
 | Copilot ignores local context | MCP server is not registered, not trusted, or retrieval is stale | Verify user MCP config, trust `local-brain`, rerun `sync`, `doctor`, and `embed` |
 | Retrieval feels weak or generic | Notes are stale, prompt is vague, or embeddings lag behind vault content | Run `sync` and `embed`, then query with a concrete symptom, subsystem, and repo name |
 
@@ -121,10 +160,12 @@ Per-project `logs.md` and per-project knowledge mirrors are deprecated. They are
 ## Query, Consult, and Capture Discipline
 
 - Use `brain:consult` for real work. It adds mode selection, confidence scoring, source priorities, and memory guidance.
-- Use `brain:query` for retrieval debugging. It answers, “What did the local index match?” rather than, “What should I do next?”
+- Use `brain:query` for retrieval debugging. It answers, “What did the local index match?” rather than, “What should I do next?” When you provide `--project`, the runtime now uses that current-project context during reranking instead of treating the search as a fully global lookup.
+- `brain:consult` now exposes a decision score and escalation drivers. If it escalates, read those drivers before fetching external guidance.
 - If `brain:query` returns weak trust signals or thin supporting evidence, treat that as a cue to improve the prompt, refresh memory, or escalate through `brain:consult` instead of forcing a local-only answer.
 - For README, architecture-doc, operator-doc, or agent-instruction work, start with local documentation patterns before inventing new structure.
 - For repo-shaped implementation work, prefer prompts that name the boundary at risk and the validation surface you expect to use. The strengthened note model now surfaces both directly when the repo exposes them.
+- Managed embedder prewarm is operational state only. It never creates query-history rows, admission usage events, or vault content.
 - Use `brain.capture_learning` only for proven, reusable outcomes.
 - Use `brain.capture_research_candidate` only for promising findings that are not yet proven enough for durable memory.
 - Remember that `research-candidates.md` is not part of the semantic core by default.
