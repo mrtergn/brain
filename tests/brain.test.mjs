@@ -7,7 +7,7 @@ import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs
 import { captureLearning, consultBrain, searchBrain } from '../packages/brain-service/index.mjs';
 import { buildResearchConsultation, synthesizeLocalAndExternalGuidance } from '../packages/research/index.mjs';
 import { BRAIN_MCP_TOOL_NAMES } from '../apps/mcp-server/index.mjs';
-import { runDoctor, runStatus } from '../apps/worker/index.mjs';
+import { runDoctor, runEmbed, runQuery, runStatus, runSync } from '../apps/worker/index.mjs';
 import { buildProjectKnowledgeSources, chunkProjectKnowledge, GLOBAL_KNOWLEDGE_CACHE_KEY } from '../packages/chunker/index.mjs';
 import {
   inspectEmbedderRunner,
@@ -590,6 +590,12 @@ test('searchBrain bootstraps a cold runtime and embeds global knowledge notes', 
   const knowledgeChunks = JSON.parse(await readFile(knowledgeChunkPath, 'utf8'));
   assert.ok(knowledgeChunks.some((chunk) => /reusable-patterns\.md$/i.test(chunk.sourcePath)));
   assert.ok(knowledgeChunks.some((chunk) => /documentation-style-patterns\.md$/i.test(chunk.sourcePath)));
+
+  const queryHistoryPath = path.join(fixture.vaultRoot, '03_Agent_Notes', 'query-history.md');
+  const queryHistory = await readFile(queryHistoryPath, 'utf8');
+  assert.ok(queryHistory.includes('## Useful Query Patterns'));
+  assert.ok(!queryHistory.includes('read-only inputs'));
+  assert.ok(!queryHistory.includes('## Recent Queries'));
 });
 
 test('searchBrain and consultBrain still work after embedder prewarm', async () => {
@@ -1203,7 +1209,7 @@ test('query history rewrite preserves curated sections while removing generated 
   await writeFile(queryHistoryPath, [
     '# Query History',
     '',
-    'Track the query shapes that reliably produce useful recall.',
+    'Keep this note short and curated. Raw query and consultation telemetry lives in `data/state/brain-state.json`, not in the vault.',
     '',
     '## Query shapes that work well',
     '- Similar bug fix plus symptom plus subsystem plus repo.',
@@ -1216,6 +1222,9 @@ test('query history rewrite preserves curated sections while removing generated 
     '',
     '## Query hygiene',
     '- Name the project whenever possible.',
+    '',
+    '## Reusable query patterns',
+    '- Promote repeated wording into prompts rather than storing transcripts here.',
     '',
     '## Promotion rule',
     'If the same query wording leads to a good result twice, promote it.',
@@ -1240,13 +1249,46 @@ test('query history rewrite preserves curated sections while removing generated 
   ]);
 
   const updated = await readFile(queryHistoryPath, 'utf8');
-  assert.ok(updated.includes('## Strong retrieval topics'));
-  assert.ok(updated.includes('BAHT deploy safety and monetization boundaries.'));
-  assert.ok(updated.includes('## Weak retrieval topics'));
-  assert.ok(updated.includes('safe place to change retry logic in brain'));
-  assert.ok(updated.includes('## Projects Recalled Most Often'));
+  assert.ok(updated.startsWith('---\n'));
+  assert.ok(updated.includes('## Useful Query Patterns'));
+  assert.ok(updated.includes('## What Belongs Here'));
+  assert.ok(updated.includes('## What Stays In Runtime State'));
+  assert.ok(updated.includes('## Promotion Criteria'));
+  assert.ok(updated.includes('## Last Curated'));
+  assert.ok(!updated.includes('safe place to change retry logic in brain'));
+  assert.ok(!updated.includes('## Projects Recalled Most Often'));
+  assert.ok(!updated.includes('## Recent Queries'));
+  assert.ok(!updated.includes('## Strong retrieval topics'));
+  assert.ok(!updated.includes('## Weak retrieval topics'));
   assert.ok(!updated.includes('## Generated Context'));
   assert.ok(!updated.includes('<!-- BRAIN:GENERATED_START -->'));
+});
+
+test('runQuery records runtime query state without rewriting curated query-history note', async () => {
+  const fixture = await createRuntimeFixture('brain-query-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+
+  await runSync(fixture.runtimeOptions);
+  await runEmbed(fixture.runtimeOptions);
+
+  const queryHistoryPath = path.join(fixture.vaultRoot, '03_Agent_Notes', 'query-history.md');
+  const before = await readFile(queryHistoryPath, 'utf8');
+  assert.ok(before.includes('## Useful Query Patterns'));
+
+  await runQuery({
+    ...fixture.runtimeOptions,
+    queryText: 'safe place in this repo to change retry logic without breaking the shared client boundary',
+    currentProjectName: 'sample',
+  });
+
+  const after = await readFile(queryHistoryPath, 'utf8');
+  assert.equal(after, before);
+  assert.ok(!after.includes('## Recent Queries'));
+  assert.ok(!after.includes('safe place in this repo to change retry logic without breaking the shared client boundary'));
+
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+  const state = await loadState(config);
+  assert.ok(state.queryHistory.some((entry) => entry.query === 'safe place in this repo to change retry logic without breaking the shared client boundary'));
 });
 
 test('runDoctor does not add query history entries during smoke checks', async () => {
@@ -1312,7 +1354,7 @@ test('runStatus and runDoctor expose runner diagnostics when the runner is alrea
   }
 });
 
-test('vault validation flags deprecated project mirrors and legacy markers', async () => {
+test('vault validation flags deprecated project mirrors, junk artifacts, and broken links', async () => {
   const vaultRoot = await mkdtemp(path.join(os.tmpdir(), 'brain-vault-'));
   TEMP_PATHS.push(vaultRoot);
   await mkdir(path.join(vaultRoot, '01_Projects', 'demo'), { recursive: true });
@@ -1329,9 +1371,13 @@ test('vault validation flags deprecated project mirrors and legacy markers', asy
     '<!-- AI_BRAIN:GENERATED_END -->',
     '',
   ].join('\n'), 'utf8');
+  await writeFile(path.join(vaultRoot, '01_Projects', 'demo', 'learnings.md'), '# demo Learnings\n\nProject: [[missing-demo-target]]\n', 'utf8');
+  await writeFile(path.join(vaultRoot, '01_Projects', 'demo', 'architecture.md'), '# demo Architecture\n', 'utf8');
+  await writeFile(path.join(vaultRoot, '01_Projects', 'demo', 'prompts.md'), '# demo Prompts\n', 'utf8');
   await writeFile(path.join(vaultRoot, '01_Projects', 'demo', 'logs.md'), '# demo Logs\n', 'utf8');
   await writeFile(path.join(vaultRoot, '04_Knowledge_Base', 'documentation-style-patterns.md'), '# Documentation Style Patterns\n', 'utf8');
   await writeFile(path.join(vaultRoot, '04_Knowledge_Base', 'demo.md'), '# demo Knowledge\n', 'utf8');
+  await writeFile(path.join(vaultRoot, '.DS_Store'), 'junk', 'utf8');
 
   const report = await validateVaultContract(vaultRoot);
 
@@ -1339,6 +1385,8 @@ test('vault validation flags deprecated project mirrors and legacy markers', asy
   assert.ok(report.issues.some((issue) => issue.kind === 'legacy-marker' && issue.path.endsWith(path.join('01_Projects', 'demo', 'overview.md'))));
   assert.ok(report.issues.some((issue) => issue.kind === 'unexpected-project-note' && issue.path.endsWith(path.join('01_Projects', 'demo', 'logs.md'))));
   assert.ok(report.issues.some((issue) => issue.kind === 'unexpected-knowledge-note' && issue.path.endsWith(path.join('04_Knowledge_Base', 'demo.md'))));
+  assert.ok(report.issues.some((issue) => issue.kind === 'vault-artifact' && issue.path.endsWith('.DS_Store')));
+  assert.ok(report.issues.some((issue) => issue.kind === 'broken-link' && issue.path.endsWith(path.join('01_Projects', 'demo', 'learnings.md'))));
   assert.ok(!report.issues.some((issue) => issue.path.endsWith(path.join('04_Knowledge_Base', 'documentation-style-patterns.md'))));
 });
 

@@ -70,6 +70,19 @@ const RUNTIME_ARTIFACT_BASENAMES = new Set([
 
 const RUNTIME_ARTIFACT_EXTENSIONS = new Set(['.plist']);
 
+const VAULT_JUNK_BASENAMES = new Set([
+  '.DS_Store',
+  '__MACOSX',
+  'Thumbs.db',
+]);
+
+const VAULT_JUNK_EXTENSIONS = new Set([
+  '.tmp',
+  '.temp',
+  '.swp',
+  '.swo',
+]);
+
 export function buildProjectNotePaths(vaultRoot, projectName) {
   const projectRoot = path.join(vaultRoot, '01_Projects', projectName);
   return Object.fromEntries(CANONICAL_PROJECT_NOTE_TYPES.map((noteType) => [noteType, path.join(projectRoot, `${noteType}.md`)]));
@@ -143,6 +156,7 @@ export async function validateVaultContract(vaultRoot) {
   const knowledgeBaseRoot = path.join(vaultRoot, '04_Knowledge_Base');
   const agentNotesRoot = path.join(vaultRoot, '03_Agent_Notes');
   const systemRoot = path.join(vaultRoot, '99_System');
+  const junkArtifacts = await findVaultJunkArtifacts(vaultRoot);
 
   const projectNames = await listProjectNames(projectRoot);
   for (const projectName of projectNames) {
@@ -158,6 +172,20 @@ export async function validateVaultContract(vaultRoot) {
       });
     }
     for (const fileName of markdownFiles.filter((file) => CANONICAL_PROJECT_NOTE_FILES.includes(file))) {
+
+  for (const targetPath of await findVaultJunkArtifacts(vaultRoot)) {
+    try {
+      await fs.stat(targetPath);
+    } catch {
+      continue;
+    }
+    try {
+      await fs.rm(targetPath, { recursive: true, force: true });
+      removedPaths.push(targetPath);
+    } catch {
+      continue;
+    }
+  }
       const filePath = path.join(projectDirectory, fileName);
       const content = await safeReadText(filePath);
       if (isLegacyManagedText(content)) {
@@ -201,6 +229,18 @@ export async function validateVaultContract(vaultRoot) {
     });
   }
 
+  for (const targetPath of junkArtifacts) {
+    issues.push({
+      kind: 'vault-artifact',
+      path: targetPath,
+      message: 'OS junk files and temp artifacts do not belong in the vault.',
+    });
+  }
+
+  for (const issue of await findBrokenWikilinks(vaultRoot)) {
+    issues.push(issue);
+  }
+
   return {
     ok: issues.length === 0,
     issues,
@@ -212,7 +252,7 @@ export function renderVaultValidationReport(report) {
   if (report.ok) {
     return [
       `Vault validation passed for ${report.projectCount} project folders.`,
-      'No deprecated notes, marker boilerplate, or runtime artifacts were detected.',
+      'No deprecated notes, broken wikilinks, marker boilerplate, runtime artifacts, or junk files were detected.',
     ].join('\n');
   }
 
@@ -266,6 +306,61 @@ async function validateManagedArea(rootPath, allowedBasenames, kind, issues) {
   }
 }
 
+async function findBrokenWikilinks(vaultRoot) {
+  const markdownPaths = await listMarkdownRelativePaths(vaultRoot);
+  const exactTargets = new Set(markdownPaths.map((relativePath) => relativePath.replace(/\.md$/i, '')));
+  const byStem = new Map();
+
+  for (const relativePath of markdownPaths) {
+    const stem = path.basename(relativePath, '.md');
+    byStem.set(stem, [...(byStem.get(stem) ?? []), relativePath.replace(/\.md$/i, '')]);
+  }
+
+  const issues = [];
+  for (const relativePath of markdownPaths) {
+    const content = await safeReadText(path.join(vaultRoot, relativePath));
+    for (const match of content.matchAll(/\[\[([^\]]+)\]\]/g)) {
+      const rawTarget = String(match[1] ?? '');
+      const candidate = rawTarget.split('|')[0].split('#')[0].trim();
+      if (!candidate || /^https?:/i.test(candidate)) {
+        continue;
+      }
+
+      const normalized = normalizeSlashes(candidate).replace(/\.md$/i, '');
+      if (exactTargets.has(normalized)) {
+        continue;
+      }
+
+      const stem = path.basename(normalized);
+      const stemMatches = byStem.get(stem) ?? [];
+      if (stemMatches.length === 1) {
+        continue;
+      }
+
+      issues.push({
+        kind: stemMatches.length > 1 ? 'ambiguous-link' : 'broken-link',
+        path: path.join(vaultRoot, relativePath),
+        message: stemMatches.length > 1
+          ? `Wikilink [[${rawTarget}]] is ambiguous. Use a stable path such as [[01_Projects/<project>/overview|label]].`
+          : `Wikilink [[${rawTarget}]] does not resolve to an existing note.`,
+      });
+    }
+  }
+
+  return issues;
+}
+
+async function listMarkdownRelativePaths(vaultRoot) {
+  const matches = [];
+  await walk(vaultRoot, async (entryPath, entry) => {
+    if (!entry.isFile() || !entry.name.endsWith('.md')) {
+      return;
+    }
+    matches.push(normalizeSlashes(path.relative(vaultRoot, entryPath)));
+  });
+  return matches;
+}
+
 async function findRuntimeArtifactsInVault(vaultRoot) {
   const matches = [];
   await walk(vaultRoot, async (entryPath, entry) => {
@@ -279,6 +374,33 @@ async function findRuntimeArtifactsInVault(vaultRoot) {
       matches.push(entryPath);
     }
   });
+  return uniqueStrings(matches);
+}
+
+async function findVaultJunkArtifacts(vaultRoot) {
+  const matches = [];
+
+  async function scan(directoryPath) {
+    const entries = await safeReadDirectory(directoryPath);
+    for (const entry of entries) {
+      const entryPath = path.join(directoryPath, entry.name);
+      const basename = entry.name;
+      const extension = path.extname(entry.name).toLowerCase();
+      if (entry.isFile() && (VAULT_JUNK_BASENAMES.has(basename) || VAULT_JUNK_EXTENSIONS.has(extension) || basename.endsWith('~'))) {
+        matches.push(entryPath);
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (VAULT_JUNK_BASENAMES.has(basename)) {
+          matches.push(entryPath);
+          continue;
+        }
+        await scan(entryPath);
+      }
+    }
+  }
+
+  await scan(vaultRoot);
   return uniqueStrings(matches);
 }
 

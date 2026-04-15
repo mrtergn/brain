@@ -118,7 +118,8 @@ This file shows what good output looks like from Brain's local retrieval and res
 
 | Output type | Destination | Embedded |
 | --- | --- | --- |
-| Query and consultation history | `03_Agent_Notes/query-history.md` | Indirectly represented through runtime state and note refresh |
+| Raw query and consultation telemetry | `data/state/brain-state.json` | No |
+| Curated query guidance | `03_Agent_Notes/query-history.md` | Yes after the next embedding cycle |
 | Research candidate | `03_Agent_Notes/research-candidates.md` | No |
 | Proven project learning | `01_Projects/<ProjectName>/learnings.md` | Yes |
 | Cross-project reusable pattern | `04_Knowledge_Base/reusable-patterns.md` | Yes after the next embedding cycle |
@@ -126,21 +127,18 @@ This file shows what good output looks like from Brain's local retrieval and res
 
 ## Query History Expectations
 
-Query history is not just raw prompt text. Consultation records include high-signal fields such as:
+`query-history.md` is now intentionally small and curated. It should keep only:
 
-- the query text
-- returned mode
-- decision score and escalation trace
-- related projects
-- top result identifiers
-- `webResearchRecommended`
-- `localConfidence`
+- query shapes that repeatedly produce useful recall
+- strong and weak retrieval zones worth remembering
+- query hygiene rules
+- reusable wording that deserves promotion into prompts or reusable patterns
 
-Runtime-only operations such as managed embedder prewarm, doctor latency diagnostics, and MCP startup readiness stay in `data/state/brain-state.json` rather than in `query-history.md`.
+Raw query and consultation telemetry, including exact prompt text, returned mode, local confidence, or result ids, stays in `data/state/brain-state.json`.
 
-Those operational events also do not count as usage-backed admission signals and never write project notes into the vault.
+Runtime-only operations such as managed embedder prewarm, doctor latency diagnostics, and MCP startup readiness also stay in `data/state/brain-state.json`.
 
-That makes `query-history.md` useful as an operator trace instead of a meaningless transcript.
+That separation keeps the vault readable while preserving the full operational trace for runtime admission and status reporting.
 
 ## What Good Output Feels Like
 

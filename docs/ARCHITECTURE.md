@@ -91,17 +91,19 @@ Each project folder under `01_Projects/<ProjectName>/` is allowed exactly four m
 
 | File | Purpose |
 | --- | --- |
-| `overview.md` | Project purpose, stack, boundaries, and change guidance |
-| `architecture.md` | Runtime structure, interfaces, and extension points |
+| `overview.md` | Project purpose plus operational sections such as Current Status, Active Risks, Next Safe Move, Do Not Break, Key Commands, and Related Patterns |
+| `architecture.md` | Runtime structure, interfaces, decisions, risks, validation surfaces, and extension points |
 | `learnings.md` | Durable, implementation-backed lessons |
-| `prompts.md` | Retrieval and agent prompt scaffolding for safe work |
+| `prompts.md` | Retrieval and agent prompt scaffolding for safe work, including explicit risky-change prompts |
+
+Managed project notes carry lightweight frontmatter with `type`, `project`, `confidence`, `managed_by`, and `updated`. The writer keeps those fields stable so notes stay inspectable without turning into metadata dumps.
 
 ### Global notes
 
 | Path | Purpose |
 | --- | --- |
 | `01_Projects/_Project_Index.md` | Project index across the vault |
-| `03_Agent_Notes/query-history.md` | Query and consultation history written from runtime state |
+| `03_Agent_Notes/query-history.md` | Curated operator guidance about effective query shapes and retrieval hygiene. Raw telemetry stays in runtime state. |
 | `03_Agent_Notes/debugging-insights.md` | Durable debugging guidance |
 | `03_Agent_Notes/agent-workflow-notes.md` | Operator and agent workflow notes |
 | `03_Agent_Notes/research-candidates.md` | Optional holding area for promising but unproven external findings |
@@ -118,6 +120,9 @@ Each project folder under `01_Projects/<ProjectName>/` is allowed exactly four m
 - per-project knowledge mirrors such as `04_Knowledge_Base/<ProjectName>.md`
 - legacy generated markers such as `<!-- AI_BRAIN:GENERATED_START -->`
 - runtime artifacts inside the vault, including launchers, state files, Chroma files, or runtime directories
+- OS junk and temp artifacts such as `.DS_Store`, `__MACOSX`, or `*.tmp`
+
+`brain:validate:vault` now also checks for broken or ambiguous Obsidian wikilinks so unstable shortcuts such as `[[brain]]` do not silently survive into the managed graph.
 
 `research-candidates.md` is intentionally optional and intentionally excluded from the semantic core. It exists to keep web-assisted work controlled without promoting raw external summaries into durable memory.
 

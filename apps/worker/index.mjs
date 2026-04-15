@@ -296,8 +296,6 @@ export async function runQuery(options = {}) {
     summary: `Query '${queryText}' matched ${reasoning.relatedProjects.join(', ') || 'no projects'}`,
   });
   await saveState(config, state);
-  const knowledgeProjects = await loadManagedKnowledgeProjects(config, state);
-  await writeManagedKnowledgeNotes(config, state, knowledgeProjects);
   await appendLog(buildLogPath(config), `query completed: ${queryText}`);
   const embedderPrewarm = await embedderPrewarmHandle.promise;
   const embedderRuntime = describeEmbedderRuntime(embedder, embedderSelection);

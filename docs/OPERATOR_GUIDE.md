@@ -157,6 +157,10 @@ The writable note model is intentionally small:
 
 Per-project `logs.md` and per-project knowledge mirrors are deprecated. They are not alternate valid models.
 
+Managed project notes now carry lightweight frontmatter with `type`, `project`, `confidence`, `managed_by`, and `updated`. The writer also normalizes stable project links such as `[[01_Projects/brain/overview|brain]]` so broken shortcut links do not accumulate.
+
+`query-history.md` is curated guidance only. Raw query and consult telemetry stays in `data/state/brain-state.json`.
+
 ## Query, Consult, and Capture Discipline
 
 - Use `brain:consult` for real work. It adds mode selection, confidence scoring, source priorities, and memory guidance.
@@ -165,7 +169,7 @@ Per-project `logs.md` and per-project knowledge mirrors are deprecated. They are
 - If `brain:query` returns weak trust signals or thin supporting evidence, treat that as a cue to improve the prompt, refresh memory, or escalate through `brain:consult` instead of forcing a local-only answer.
 - For README, architecture-doc, operator-doc, or agent-instruction work, start with local documentation patterns before inventing new structure.
 - For repo-shaped implementation work, prefer prompts that name the boundary at risk and the validation surface you expect to use. The strengthened note model now surfaces both directly when the repo exposes them.
-- Managed embedder prewarm is operational state only. It never creates query-history rows, admission usage events, or vault content.
+- Managed embedder prewarm is operational state only. It never creates curated query-history content, admission usage events, or vault content.
 - Use `brain.capture_learning` only for proven, reusable outcomes.
 - Use `brain.capture_research_candidate` only for promising findings that are not yet proven enough for durable memory.
 - Remember that `research-candidates.md` is not part of the semantic core by default.
@@ -178,13 +182,20 @@ Per-project `logs.md` and per-project knowledge mirrors are deprecated. They are
 | `data/cache/chunks/` | Chunk cache used for embeddings and retrieval |
 | `data/chroma/` | Local vector store |
 | `data/logs/` | Runtime and MCP logs |
-| `data/state/` | Last scan, sync, embed, and query history state |
+| `data/state/` | Last scan, sync, embed, raw query telemetry, and usage-backed admission state |
 | `data/runtime/` | Generated launchers such as `run-brain.sh` and `run-brain-mcp.sh` |
+
+## Clean Vault Export
+
+- Run `npm run brain:validate:vault` before exporting or archiving the vault.
+- Remove `.DS_Store`, `__MACOSX`, and temp files before packaging the vault for backup or sharing.
+- On macOS, prefer archive commands that exclude Finder metadata explicitly rather than zipping the vault directory blindly.
 
 ## Safe Operating Habits
 
 - Re-run `brain:init` after changing runtime launcher generation or MCP integration.
 - Re-run `brain:validate:vault` after changing note writing, cleanup rules, or the vault contract.
+- Treat `brain:validate:vault` as a graph check as well as a shape check. It now catches broken wikilinks and junk artifacts, not only deprecated note files.
 - Re-run `brain:doctor` after integrated changes that affect retrieval, consultation, or MCP readiness.
 - Prefer concrete queries that name the repo, subsystem, and failure mode.
 - Keep external findings provisional until implementation proves they should become memory.

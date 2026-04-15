@@ -181,7 +181,7 @@ What each stage does:
 - `brain:bootstrap:python` creates `.venv` and installs the local embedding stack.
 - `brain:init` creates runtime folders, vault scaffolding, and launcher scripts under `data/runtime/`.
 - `brain:sync` refreshes canonical project notes and managed global notes, including cross-project documentation-style patterns.
-- `brain:validate:vault` fails if legacy markers, project logs, knowledge mirrors, or runtime artifacts reappear in the vault.
+- `brain:validate:vault` fails if legacy markers, broken wikilinks, project logs, knowledge mirrors, runtime artifacts, or junk files reappear in the vault.
 - `brain:doctor` checks vault integrity, retrieval readiness, consultation behavior, project-level retrieval diagnostics, usage-backed memory-admission state, managed embedder prewarm readiness, latency warnings, and MCP health.
 - `brain:doctor`, `brain:query`, and `brain:consult` now also verify that the runtime can expose trust-aware evidence fields instead of returning opaque matches.
 - Retrieval now reuses a shared local Chroma sidecar inside each process, so repeated searches stop paying Python startup on every vector-store call.
@@ -189,6 +189,8 @@ What each stage does:
 - `brain:consult` is the primary guidance entrypoint.
 - `brain:query` is the lower-level retrieval debugger.
 - `brain:status` now shows local usage-backed admission counters, derived learning activity, and the latest embedder prewarm summary in addition to runtime paths and timestamps.
+- Managed project notes now carry lightweight frontmatter with `type`, `project`, `confidence`, `managed_by`, and `updated`, and the writer keeps stable Obsidian links instead of bare project-name shortcuts.
+- `03_Agent_Notes/query-history.md` is curated guidance only. Raw query and consult telemetry stays under `data/state/`.
 - One-shot CLI retrieval can also reuse a dedicated persistent local embedder runner through `brain:runner:start`, `brain:runner:status`, `brain:runner:restart`, and `brain:runner:stop`.
 - `brain:mcp` starts the `local-brain` MCP server and, in the default `auto` mode, blocks on embedder readiness once at startup so later agent requests do not pay the first model-load hit.
 

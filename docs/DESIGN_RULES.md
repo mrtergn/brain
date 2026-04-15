@@ -36,6 +36,8 @@ The supported note surfaces are intentionally narrow:
 - agent notes: `query-history.md`, `debugging-insights.md`, `agent-workflow-notes.md`, and optional `research-candidates.md`
 - system notes: `99_System/*.md`
 
+Managed project notes should keep lightweight frontmatter and stable links, and they should surface operational sections rather than generic summaries. `query-history.md` is curated guidance, not a raw transcript of runtime telemetry.
+
 Anything outside that model must justify itself against the core product story. In most cases, the right answer is to strengthen the existing notes rather than add a new note type.
 
 ## Memory Promotion Model
@@ -54,6 +56,7 @@ The point of the model is to keep retrieval trustworthy. Raw external summaries 
 - Boundary rules and validation surfaces should come from repo evidence such as docs, agent guidance, or runnable scripts before they fall back to heuristics.
 - Retrieval and consultation should explain trust, not only semantic similarity. Local matches without strong support must remain visibly weaker than evidence-backed matches.
 - The vault may surface selective confidence and evidence lines for human readers, but it must not become a raw provenance dump or metadata mirror.
+- Raw query telemetry belongs in runtime state, not in human-facing vault notes.
 - External findings do not become durable memory until they are proven enough to survive the promotion model above.
 
 ## Documentation Intelligence Rules
@@ -76,7 +79,7 @@ The point of the model is to keep retrieval trustworthy. Raw external summaries 
 
 - `brain:sync` may rewrite canonical note content and remove deprecated vault artifacts.
 - `brain:sync` must not recreate deprecated note types or marker boilerplate.
-- `brain:validate:vault` is the structural contract check.
+- `brain:validate:vault` is the structural and graph contract check. It should fail on deprecated note shapes, broken wikilinks, and junk artifacts.
 - `brain:doctor` is the operational contract check, including provenance-aware query and consult smoke behavior.
 - `brain:init` must be rerun after launcher or MCP integration changes that affect generated runtime assets.
 

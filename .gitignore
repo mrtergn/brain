@@ -13,6 +13,7 @@ data/cache/chunks/*.json
 data/cache/models/
 data/chroma/**
 !data/chroma/README.md
+data/backups/
 data/logs/*.log
 data/state/*.json
 !data/state/README.md

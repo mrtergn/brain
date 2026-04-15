@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { createCliSemanticEmbedder, describeEmbedderRuntime } from '../embedder-runner/index.mjs';
-import { readProjectNoteContents, writeQueryHistoryNote as writeCanonicalQueryHistoryNote } from '../obsidian-writer/index.mjs';
+import { readProjectNoteContents } from '../obsidian-writer/index.mjs';
 import {
   maxEvidenceConfidence,
   maxEvidenceQuality,
@@ -118,7 +118,6 @@ export async function searchBrain({
     });
     await saveState(readyRuntime.config, readyRuntime.state);
     readyRuntime.state = await loadState(readyRuntime.config);
-    await refreshQueryHistoryNote(readyRuntime.config, readyRuntime.state);
   }
 
   await appendLog(buildLogPath(readyRuntime.config, 'brain-mcp.log'), `brain.search | query=${JSON.stringify(query)} | project=${resolvedProject?.name ?? 'global'}`);
@@ -234,7 +233,6 @@ export async function consultBrain({
     });
     await saveState(readyRuntime.config, readyRuntime.state);
     readyRuntime.state = await loadState(readyRuntime.config);
-    await refreshQueryHistoryNote(readyRuntime.config, readyRuntime.state);
   }
 
   await appendLog(buildLogPath(readyRuntime.config, 'brain-mcp.log'), `brain.consult | query=${JSON.stringify(query)} | project=${resolvedProject?.name ?? 'global'} | mode=${payload.mode}`);
@@ -908,10 +906,11 @@ function buildProjectNoteReferences(config, projectName) {
 
 function buildCapturedLearningEntry({ index, title, projectName, problem, context, solution, whyItWorked, reusablePattern, tags }) {
   const formattedTags = uniqueStrings((tags ?? []).map((tag) => String(tag).trim()).filter(Boolean)).map((tag) => `#${tag.replace(/^#/, '')}`);
+  const projectLink = buildProjectOverviewLink(projectName);
   return [
     `## ${index}. ${String(title ?? 'Captured learning').trim() || 'Captured learning'}`,
     '',
-    formattedTags.length > 0 ? `Project: [[${projectName}]] | Tags: ${formattedTags.join(' ')}` : `Project: [[${projectName}]]`,
+    formattedTags.length > 0 ? `Project: ${projectLink} | Tags: ${formattedTags.join(' ')}` : `Project: ${projectLink}`,
     '',
     '**Problem**',
     String(problem ?? '').trim(),
@@ -952,7 +951,7 @@ function buildResearchCandidateEntry({
     `### ${timestamp().slice(0, 10)} | ${String(title ?? 'Research candidate').trim()}`,
     '',
     `Query: ${String(query ?? '').trim()}`,
-    `Project: ${projectName ? `[[${projectName}]]` : 'cross-project'}${formattedTags.length > 0 ? ` | Tags: ${formattedTags.join(' ')}` : ''}`,
+    `Project: ${projectName ? buildProjectOverviewLink(projectName) : 'cross-project'}${formattedTags.length > 0 ? ` | Tags: ${formattedTags.join(' ')}` : ''}`,
     `Evidence quality: ${String(sourceQuality ?? '').trim()} | Reuse potential: ${String(reusePotential ?? '').trim()}`,
     '',
     '#### Finding',
@@ -985,25 +984,51 @@ function appendCanonicalEntry(existing, entry) {
 }
 
 function normalizeLearningNote(existing, projectName) {
-  return normalizeCanonicalNote(existing, `# ${projectName} Learnings`, [
-    '#learning #pattern',
-    '## Manual Notes',
-    'Keep human-reviewed lessons here when they need extra nuance beyond the generated patterns.',
-  ]);
+  return normalizeCanonicalProjectNote(existing, {
+    frontmatter: buildManagedFrontmatter({
+      type: 'project-learnings',
+      project: projectName,
+      managed_by: 'brain',
+      updated: timestamp().slice(0, 10),
+    }),
+    title: `# ${projectName} Learnings`,
+    removableLines: [
+      '#learning #pattern',
+      '## Manual Notes',
+      'Keep human-reviewed lessons here when they need extra nuance beyond the generated patterns.',
+    ],
+    projectName,
+  });
 }
 
 function normalizeResearchCandidatesNote(existing) {
-  return normalizeCanonicalNote(existing, RESEARCH_CANDIDATES_TEMPLATE, [
-    '#agent-note #research #candidate',
-    '## Manual Notes',
-    'Store promising external findings here only when they look reusable but are not yet proven enough for project learnings or reusable-patterns.',
-  ]);
+  return normalizeCanonicalProjectNote(existing, {
+    frontmatter: buildManagedFrontmatter({
+      type: 'research-candidates',
+      confidence: 'low',
+      managed_by: 'brain',
+      updated: timestamp().slice(0, 10),
+    }),
+    title: '# Research Candidates',
+    fallbackBody: stripFrontmatter(RESEARCH_CANDIDATES_TEMPLATE),
+    removableLines: [
+      '#agent-note #research #candidate',
+      '## Manual Notes',
+      'Store promising external findings here only when they look reusable but are not yet proven enough for project learnings or reusable-patterns.',
+    ],
+  });
 }
 
-function normalizeCanonicalNote(existing, fallbackHeading, removableLines = []) {
-  const cleaned = stripLegacyManagedSections(existing).trim();
+function normalizeCanonicalProjectNote(existing, {
+  frontmatter,
+  title,
+  fallbackBody = '',
+  removableLines = [],
+  projectName = null,
+} = {}) {
+  const cleaned = stripLegacyManagedSections(stripFrontmatter(existing)).trim();
   if (!cleaned) {
-    return fallbackHeading;
+    return `${[frontmatter, title, '', fallbackBody.trim()].filter(Boolean).join('\n').trimEnd()}\n`;
   }
 
   const removable = new Set(removableLines);
@@ -1019,13 +1044,11 @@ function normalizeCanonicalNote(existing, fallbackHeading, removableLines = []) 
     .join('\n')
     .trim();
 
-  if (!filteredLines) {
-    return fallbackHeading;
+  const normalizedBody = normalizeStableProjectLinks(stripLeadingTitleBlock(filteredLines), projectName);
+  if (!normalizedBody) {
+    return `${[frontmatter, title, '', fallbackBody.trim()].filter(Boolean).join('\n').trimEnd()}\n`;
   }
-  if (filteredLines.startsWith('# ')) {
-    return filteredLines;
-  }
-  return `${fallbackHeading}\n\n${filteredLines}`;
+  return `${[frontmatter, title, '', normalizedBody.trim()].filter(Boolean).join('\n').trimEnd()}\n`;
 }
 
 function nextLearningIndex(noteText) {
@@ -1277,7 +1300,7 @@ function parseResearchCandidateEntries(text) {
     const findingMatch = sectionText.match(/#### Finding\n([\s\S]*?)\n\n#### Why It Matters/m);
     return {
       title,
-      projectName: projectMatch?.[1]?.replace(/\[\[|\]\]/g, '').trim() || null,
+      projectName: extractProjectNameFromLink(projectMatch?.[1] ?? '') || null,
       finding: firstNonEmptyLine(findingMatch?.[1] ?? '') ?? 'Research candidate',
     };
   }).filter((entry) => entry.title);
@@ -1306,10 +1329,6 @@ async function safeFileTimestamp(filePath) {
   } catch {
     return null;
   }
-}
-
-async function refreshQueryHistoryNote(config, state) {
-  await writeCanonicalQueryHistoryNote(config, state.queryHistory ?? []);
 }
 
 function extractBoldField(text, label) {
@@ -1373,4 +1392,88 @@ function containsTechnicalAnchor(value) {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildProjectOverviewLink(projectName) {
+  return `[[01_Projects/${projectName}/overview|${projectName}]]`;
+}
+
+function buildManagedFrontmatter(fields) {
+  const lines = ['---'];
+  for (const [key, value] of Object.entries(fields ?? {})) {
+    if (value == null || value === '') {
+      continue;
+    }
+    lines.push(`${key}: ${renderFrontmatterScalar(value)}`);
+  }
+  lines.push('---');
+  return lines.join('\n');
+}
+
+function renderFrontmatterScalar(value) {
+  const normalized = String(value ?? '').trim();
+  if (/^[A-Za-z0-9_.\/-]+$/.test(normalized)) {
+    return normalized;
+  }
+  return JSON.stringify(normalized);
+}
+
+function stripFrontmatter(text) {
+  const value = String(text ?? '');
+  if (!value.startsWith('---\n')) {
+    return value;
+  }
+  const endIndex = value.indexOf('\n---\n', 4);
+  if (endIndex === -1) {
+    return value;
+  }
+  return value.slice(endIndex + 5);
+}
+
+function stripLeadingTitleBlock(text) {
+  const lines = String(text ?? '').split('\n');
+  let index = 0;
+  while (index < lines.length && !lines[index].trim()) {
+    index += 1;
+  }
+  if (index < lines.length && /^#\s+/.test(lines[index].trim())) {
+    index += 1;
+  }
+  while (index < lines.length && !/^##\s+/.test(lines[index].trim()) && !/^###\s+/.test(lines[index].trim())) {
+    index += 1;
+  }
+  return lines.slice(index).join('\n').trim();
+}
+
+function normalizeStableProjectLinks(text, projectName) {
+  if (!projectName) {
+    return String(text ?? '');
+  }
+  return String(text ?? '')
+    .replace(new RegExp(`\\[\\[${escapeRegExp(projectName)}\\]\\]`, 'g'), buildProjectOverviewLink(projectName))
+    .replace(new RegExp(`Project:\\s+\\[\\[${escapeRegExp(projectName)}\\]\\]`, 'g'), `Project: ${buildProjectOverviewLink(projectName)}`);
+}
+
+function extractProjectNameFromLink(value) {
+  const normalized = String(value ?? '').trim();
+  if (!normalized || normalized === 'cross-project') {
+    return null;
+  }
+
+  const wikiMatch = normalized.match(/^\[\[([^\]|]+)(?:\|([^\]]+))?\]\]$/);
+  if (!wikiMatch) {
+    return normalized;
+  }
+
+  const rawTarget = wikiMatch[1].trim();
+  const label = wikiMatch[2]?.trim();
+  if (label) {
+    return label;
+  }
+
+  const targetParts = rawTarget.split('/').filter(Boolean);
+  if (targetParts.length >= 2 && targetParts[0] === '01_Projects') {
+    return targetParts[1];
+  }
+  return rawTarget;
 }
