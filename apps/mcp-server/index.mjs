@@ -49,6 +49,9 @@ server.registerTool('brain.search', {
     query: z.string().min(1),
     current_project_path: z.string().optional(),
     current_project_name: z.string().optional(),
+    workspace_id: z.string().optional(),
+    agent_id: z.string().optional(),
+    include_preflight: z.boolean().optional(),
     top_k: z.number().int().min(1).max(12).optional(),
   },
   outputSchema: {
@@ -121,14 +124,110 @@ server.registerTool('brain.search', {
       title: z.string(),
       excerpt: z.string(),
       notePath: z.string(),
-      updatedAt: z.string().nullable(),
-    })),
+        updatedAt: z.string().nullable(),
+      })),
+    assembledContext: z.object({
+      retrievalProfile: z.string(),
+      scope: z.object({
+        currentProjectName: z.string().nullable(),
+        currentProjectPath: z.string().nullable(),
+        relatedProjects: z.array(z.string()),
+      }),
+      noteReferences: z.object({
+        overview: z.string().nullable(),
+        architecture: z.string().nullable(),
+        learnings: z.string().nullable(),
+        prompts: z.string().nullable(),
+        knowledge: z.string().nullable(),
+        documentationStyle: z.string().nullable(),
+      }),
+      topEvidence: z.array(z.object({
+        project: z.string(),
+        noteType: z.string(),
+        sourcePath: z.string(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+        whyTrusted: z.string(),
+      })),
+      validationHints: z.array(z.string()),
+      recentEpisodes: z.array(z.object({
+        id: z.string(),
+        at: z.string(),
+        source: z.string(),
+        query: z.string(),
+        summary: z.string(),
+        currentProjectName: z.string().nullable(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+      })),
+      distillationCandidates: z.array(z.object({
+        id: z.string(),
+        title: z.string(),
+        status: z.string(),
+        targetType: z.string(),
+        targetPath: z.string().nullable(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+        summary: z.string(),
+      })),
+      recentDecisions: z.array(z.object({
+        id: z.string(),
+        at: z.string(),
+        summary: z.string(),
+        recommendedAction: z.string(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+      })),
+      invalidationWarnings: z.array(z.object({
+        id: z.string(),
+        projectName: z.string(),
+        staleReasons: z.array(z.string()),
+        affectedArtifacts: z.array(z.string()),
+        status: z.string(),
+      })),
+      promptPatterns: z.array(z.object({
+        id: z.string(),
+        normalizedText: z.string(),
+        retrievalProfile: z.string(),
+        useCount: z.number(),
+      })),
+      graphContext: z.object({
+        neighbors: z.array(z.object({
+          project: z.string(),
+          relation: z.string(),
+          weight: z.number(),
+          reasons: z.array(z.string()),
+        })),
+      }),
+      workspace: z.object({
+        id: z.string(),
+        task: z.string(),
+        status: z.string(),
+        hypotheses: z.array(z.string()),
+        findings: z.array(z.string()),
+        handoffs: z.array(z.string()),
+      }).nullable(),
+      preflightSimulation: z.object({
+        affectedProjects: z.array(z.string()),
+        staleWarnings: z.array(z.string()),
+        validationPlan: z.array(z.string()),
+        relatedPatterns: z.array(z.string()),
+      }).nullable(),
+      provenanceSummary: z.array(z.string()),
+      embedderRuntime: z.object({
+        backend: z.string(),
+        usedRunner: z.boolean(),
+      }).nullable(),
+    }),
   },
-}, async ({ query, current_project_path, current_project_name, top_k }) => {
+}, async ({ query, current_project_path, current_project_name, workspace_id, agent_id, include_preflight, top_k }) => {
   const payload = await searchBrain({
     query,
     currentProjectPath: current_project_path,
     currentProjectName: current_project_name,
+    workspaceId: workspace_id,
+    agentId: agent_id,
+    includePreflight: include_preflight,
     topK: top_k,
   });
 
@@ -150,6 +249,9 @@ server.registerTool('brain.consult', {
     query: z.string().min(1),
     current_project_path: z.string().optional(),
     current_project_name: z.string().optional(),
+    workspace_id: z.string().optional(),
+    agent_id: z.string().optional(),
+    include_preflight: z.boolean().optional(),
     top_k: z.number().int().min(1).max(12).optional(),
   },
   outputSchema: {
@@ -304,13 +406,109 @@ server.registerTool('brain.consult', {
         updatedAt: z.string().nullable(),
       })),
     }),
+    assembledContext: z.object({
+      retrievalProfile: z.string(),
+      scope: z.object({
+        currentProjectName: z.string().nullable(),
+        currentProjectPath: z.string().nullable(),
+        relatedProjects: z.array(z.string()),
+      }),
+      noteReferences: z.object({
+        overview: z.string().nullable(),
+        architecture: z.string().nullable(),
+        learnings: z.string().nullable(),
+        prompts: z.string().nullable(),
+        knowledge: z.string().nullable(),
+        documentationStyle: z.string().nullable(),
+      }),
+      topEvidence: z.array(z.object({
+        project: z.string(),
+        noteType: z.string(),
+        sourcePath: z.string(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+        whyTrusted: z.string(),
+      })),
+      validationHints: z.array(z.string()),
+      recentEpisodes: z.array(z.object({
+        id: z.string(),
+        at: z.string(),
+        source: z.string(),
+        query: z.string(),
+        summary: z.string(),
+        currentProjectName: z.string().nullable(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+      })),
+      distillationCandidates: z.array(z.object({
+        id: z.string(),
+        title: z.string(),
+        status: z.string(),
+        targetType: z.string(),
+        targetPath: z.string().nullable(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+        summary: z.string(),
+      })),
+      recentDecisions: z.array(z.object({
+        id: z.string(),
+        at: z.string(),
+        summary: z.string(),
+        recommendedAction: z.string(),
+        evidenceQuality: z.string(),
+        confidence: z.number(),
+      })),
+      invalidationWarnings: z.array(z.object({
+        id: z.string(),
+        projectName: z.string(),
+        staleReasons: z.array(z.string()),
+        affectedArtifacts: z.array(z.string()),
+        status: z.string(),
+      })),
+      promptPatterns: z.array(z.object({
+        id: z.string(),
+        normalizedText: z.string(),
+        retrievalProfile: z.string(),
+        useCount: z.number(),
+      })),
+      graphContext: z.object({
+        neighbors: z.array(z.object({
+          project: z.string(),
+          relation: z.string(),
+          weight: z.number(),
+          reasons: z.array(z.string()),
+        })),
+      }),
+      workspace: z.object({
+        id: z.string(),
+        task: z.string(),
+        status: z.string(),
+        hypotheses: z.array(z.string()),
+        findings: z.array(z.string()),
+        handoffs: z.array(z.string()),
+      }).nullable(),
+      preflightSimulation: z.object({
+        affectedProjects: z.array(z.string()),
+        staleWarnings: z.array(z.string()),
+        validationPlan: z.array(z.string()),
+        relatedPatterns: z.array(z.string()),
+      }).nullable(),
+      provenanceSummary: z.array(z.string()),
+      embedderRuntime: z.object({
+        backend: z.string(),
+        usedRunner: z.boolean(),
+      }).nullable(),
+    }),
     agentActions: z.array(z.string()),
   },
-}, async ({ query, current_project_path, current_project_name, top_k }) => {
+}, async ({ query, current_project_path, current_project_name, workspace_id, agent_id, include_preflight, top_k }) => {
   const payload = await consultBrain({
     query,
     currentProjectPath: current_project_path,
     currentProjectName: current_project_name,
+    workspaceId: workspace_id,
+    agentId: agent_id,
+    includePreflight: include_preflight,
     topK: top_k,
   });
 
@@ -856,6 +1054,20 @@ function renderSearchText(payload) {
       lines.push(`- ${pattern.patternTitle} | projects: ${pattern.sourceProjects.join(', ')}`);
     }
   }
+  if (payload.assembledContext?.validationHints?.length > 0) {
+    lines.push('');
+    lines.push(`Live context profile: ${payload.assembledContext.retrievalProfile}`);
+    for (const hint of payload.assembledContext.validationHints.slice(0, 3)) {
+      lines.push(`- context: ${hint}`);
+    }
+  }
+  if (payload.assembledContext?.recentEpisodes?.length > 0) {
+    lines.push('');
+    lines.push('Recent episodes:');
+    for (const episode of payload.assembledContext.recentEpisodes.slice(0, 2)) {
+      lines.push(`- ${episode.currentProjectName ?? 'global'} | ${episode.summary || episode.query}`);
+    }
+  }
   if (payload.memoryAdmission?.touchedCandidates?.length > 0) {
     lines.push('');
     lines.push('Memory admission candidates:');
@@ -910,6 +1122,27 @@ function renderConsultationText(payload) {
     lines.push('Memory admission candidates:');
     for (const candidate of payload.memoryAdmission.touchedCandidates.slice(0, 3)) {
       lines.push(`- ${candidate.project}/${candidate.noteType} -> ${candidate.targetPath ?? candidate.targetType} | score=${candidate.score}`);
+    }
+  }
+  if (payload.assembledContext?.validationHints?.length > 0) {
+    lines.push('');
+    lines.push(`Live context profile: ${payload.assembledContext.retrievalProfile}`);
+    for (const hint of payload.assembledContext.validationHints.slice(0, 3)) {
+      lines.push(`- ${hint}`);
+    }
+  }
+  if (payload.assembledContext?.distillationCandidates?.length > 0) {
+    lines.push('');
+    lines.push('Distillation candidates:');
+    for (const candidate of payload.assembledContext.distillationCandidates.slice(0, 2)) {
+      lines.push(`- ${candidate.title} -> ${candidate.targetPath ?? candidate.targetType} | ${candidate.evidenceQuality} ${candidate.confidence}`);
+    }
+  }
+  if (payload.assembledContext?.preflightSimulation) {
+    lines.push('');
+    lines.push('Preflight:');
+    for (const project of payload.assembledContext.preflightSimulation.affectedProjects.slice(0, 4)) {
+      lines.push(`- affected: ${project}`);
     }
   }
   lines.push('');

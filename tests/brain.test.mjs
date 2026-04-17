@@ -20,7 +20,23 @@ import { normalizeProject } from '../packages/normalizer/index.mjs';
 import { syncNotes, writeQueryHistoryNote } from '../packages/obsidian-writer/index.mjs';
 import { expandQueryText, retrieveContext } from '../packages/retriever/index.mjs';
 import { buildRuntimeConfig } from '../packages/shared/index.mjs';
-import { getLastLearningActivityAt, loadState, normalizeState, recordMemoryUsage, summarizeMemoryAdmission } from '../packages/state-manager/index.mjs';
+import {
+  getDecisionJournalPath,
+  getDistillationCandidatesPath,
+  getEpisodesPath,
+  getInvalidationIndexPath,
+  getLastLearningActivityAt,
+  getProjectGraphPath,
+  getPromptPatternsPath,
+  getWorkspaceFilePath,
+  listDistillationCandidates,
+  listRecentEpisodes,
+  loadProjectGraph,
+  loadState,
+  normalizeState,
+  recordMemoryUsage,
+  summarizeMemoryAdmission,
+} from '../packages/state-manager/index.mjs';
 import { shutdownChromaService } from '../packages/vector-store/index.mjs';
 import { cleanupDeprecatedVaultArtifacts, validateVaultContract } from '../packages/vault-contract/index.mjs';
 import { analyzeProject } from '../scripts/ai-brain/lib/project-analysis.mjs';
@@ -596,6 +612,38 @@ test('searchBrain bootstraps a cold runtime and embeds global knowledge notes', 
   assert.ok(queryHistory.includes('## Useful Query Patterns'));
   assert.ok(!queryHistory.includes('read-only inputs'));
   assert.ok(!queryHistory.includes('## Recent Queries'));
+  assert.equal(payload.assembledContext.retrievalProfile, 'current-project-strict');
+  assert.ok(payload.assembledContext.validationHints.length > 0);
+});
+
+test('searchBrain records recent episodes and runtime distillation candidates without writing them to the vault', async () => {
+  const fixture = await createRuntimeFixture('brain-episode-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+
+  const payload = await searchBrain({
+    query: 'read-only inputs',
+    currentProjectName: 'sample',
+    runtimeOptions: fixture.runtimeOptions,
+  });
+
+  assert.ok(payload.assembledContext.recentEpisodes.length >= 0);
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+  const episodes = await listRecentEpisodes(config, { currentProjectName: 'sample', limit: 5 });
+  assert.ok(episodes.length >= 1);
+  assert.equal(episodes[0].currentProjectName, 'sample');
+
+  const episodeLog = await readFile(getEpisodesPath(config), 'utf8');
+  assert.ok(episodeLog.includes('read-only inputs'));
+
+  const candidates = await listDistillationCandidates(config, { currentProjectName: 'sample', limit: 5 });
+  assert.ok(candidates.length >= 1);
+  assert.ok(candidates[0].targetPath.endsWith(path.join('01_Projects', 'sample', 'learnings.md')));
+
+  const candidateFile = JSON.parse(await readFile(getDistillationCandidatesPath(config), 'utf8'));
+  assert.ok(candidateFile.length >= 1);
+  const learningsPath = path.join(fixture.vaultRoot, '01_Projects', 'sample', 'learnings.md');
+  const learningsText = await readFile(learningsPath, 'utf8');
+  assert.ok(!learningsText.includes(candidateFile[0].title));
 });
 
 test('searchBrain and consultBrain still work after embedder prewarm', async () => {
@@ -627,6 +675,66 @@ test('searchBrain and consultBrain still work after embedder prewarm', async () 
   });
   assert.ok(['local-only', 'local-plus-web-assist', 'web-first-local-adaptation'].includes(consultation.mode));
   assert.ok(consultation.decisionTrace);
+  assert.equal(consultation.assembledContext.scope.currentProjectName, 'sample');
+  assert.ok(Array.isArray(consultation.assembledContext.topEvidence));
+});
+
+test('consultBrain records decision memory, prompt patterns, workspace state, and preflight context', async () => {
+  const fixture = await createRuntimeFixture('brain-consult-memory-runtime-');
+  await createSampleProject(path.join(fixture.projectsRoot, 'sample'));
+
+  const payload = await consultBrain({
+    query: 'safe extension point for runtime memory changes',
+    currentProjectName: 'sample',
+    workspaceId: 'ws-sample',
+    agentId: 'agent-alpha',
+    includePreflight: true,
+    runtimeOptions: fixture.runtimeOptions,
+  });
+
+  assert.equal(payload.assembledContext.retrievalProfile, 'current-project-strict');
+  assert.ok(payload.assembledContext.preflightSimulation);
+
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+  const decisions = parseJsonLinesForTest(await readFile(getDecisionJournalPath(config), 'utf8'));
+  assert.ok(decisions.length >= 1);
+  assert.equal(decisions[0].currentProjectName, 'sample');
+
+  const promptPatterns = JSON.parse(await readFile(getPromptPatternsPath(config), 'utf8'));
+  assert.ok(promptPatterns.length >= 1);
+  assert.equal(promptPatterns[0].currentProjectName, 'sample');
+
+  const workspace = JSON.parse(await readFile(getWorkspaceFilePath(config, 'ws-sample'), 'utf8'));
+  assert.equal(workspace.id, 'ws-sample');
+  assert.ok(workspace.handoffs.some((item) => item.includes('agent-alpha')));
+});
+
+test('runScan refreshes the project graph and records invalidation when project fingerprints change', async () => {
+  const fixture = await createRuntimeFixture('brain-graph-runtime-');
+  const projectRoot = path.join(fixture.projectsRoot, 'sample');
+  await createSampleProject(projectRoot);
+
+  await runSync(fixture.runtimeOptions);
+  await writeFile(path.join(projectRoot, 'README.md'), [
+    '# Sample Project',
+    '',
+    '- Source repositories are read-only inputs.',
+    '- Keep runtime state under data/ instead of the knowledge vault.',
+    '- Added a new workflow note so the fingerprint changes.',
+  ].join('\n'), 'utf8');
+
+  await runSync(fixture.runtimeOptions);
+
+  const config = buildRuntimeConfig(fixture.runtimeOptions);
+  const invalidations = JSON.parse(await readFile(getInvalidationIndexPath(config), 'utf8'));
+  assert.ok(invalidations.length >= 1);
+  assert.equal(invalidations[0].projectName, 'sample');
+
+  const graph = await loadProjectGraph(config);
+  assert.ok(graph.updatedAt);
+  assert.ok(graph.nodes.some((node) => node.project === 'sample'));
+  const graphFile = JSON.parse(await readFile(getProjectGraphPath(config), 'utf8'));
+  assert.ok(Array.isArray(graphFile.nodes));
 });
 
 test('searchBrain and consultBrain can reuse the persistent embedder runner without changing behavior', async () => {
@@ -1633,4 +1741,12 @@ function createProjectStub(name) {
     },
     analysis: {},
   };
+}
+
+function parseJsonLinesForTest(content) {
+  return String(content)
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }

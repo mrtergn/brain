@@ -1,13 +1,16 @@
+import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
   ensureDir,
   readJson,
+  readText,
   sha256,
   timestamp,
   tokenize,
   uniqueStrings,
   writeJson,
+  writeText,
 } from '../shared/index.mjs';
 import { isCanonicalKnowledgeBasePath } from '../vault-contract/index.mjs';
 
@@ -22,6 +25,11 @@ const MAX_DISTINCT_QUERY_FINGERPRINTS = 12;
 const PROMOTION_MIN_USE_COUNT = 3;
 const PROMOTION_MIN_DISTINCT_QUERIES = 2;
 const PROMOTION_MIN_AVERAGE_RELEVANCE = 0.55;
+const MAX_EPISODES = 160;
+const MAX_DISTILLATION_CANDIDATES = 64;
+const MAX_DECISIONS = 120;
+const MAX_PROMPT_PATTERNS = 64;
+const MAX_INVALIDATIONS = 160;
 
 export function createEmptyState(config) {
   return {
@@ -55,7 +63,40 @@ export async function ensureBrainLayout(config) {
     ensureDir(config.logRoot),
     ensureDir(config.chromaRoot),
     ensureDir(config.runtimeRoot),
+    ensureDir(path.join(config.stateRoot, 'workspaces')),
   ]);
+}
+
+export function getEpisodesPath(config) {
+  return path.join(config.stateRoot, 'episodes.jsonl');
+}
+
+export function getDistillationCandidatesPath(config) {
+  return path.join(config.stateRoot, 'distillation-candidates.json');
+}
+
+export function getWorkspaceStateRoot(config) {
+  return path.join(config.stateRoot, 'workspaces');
+}
+
+export function getDecisionJournalPath(config) {
+  return path.join(config.stateRoot, 'decision-journal.jsonl');
+}
+
+export function getInvalidationIndexPath(config) {
+  return path.join(config.stateRoot, 'invalidation-index.json');
+}
+
+export function getPromptPatternsPath(config) {
+  return path.join(config.stateRoot, 'prompt-patterns.json');
+}
+
+export function getProjectGraphPath(config) {
+  return path.join(config.stateRoot, 'causal-graph.json');
+}
+
+export function getWorkspaceFilePath(config, workspaceId) {
+  return path.join(getWorkspaceStateRoot(config), `${workspaceId}.json`);
 }
 
 export async function loadState(config) {
@@ -442,6 +483,169 @@ export function summarizeMemoryAdmission(state, config = null) {
   };
 }
 
+export async function recordEpisode(config, episode = {}) {
+  await ensureBrainLayout(config);
+  const normalizedEpisode = normalizeEpisodeRecord(episode);
+  if (!normalizedEpisode) {
+    return null;
+  }
+  await appendFile(getEpisodesPath(config), `${JSON.stringify(normalizedEpisode)}\n`, 'utf8');
+  await trimJsonLinesFile(getEpisodesPath(config), MAX_EPISODES);
+  return normalizedEpisode;
+}
+
+export async function listRecentEpisodes(config, { currentProjectName = null, query = '', limit = 4 } = {}) {
+  await ensureBrainLayout(config);
+  const lines = parseJsonLines(await readText(getEpisodesPath(config), ''));
+  const normalizedQuery = String(query ?? '').trim().toLowerCase();
+  return lines
+    .map((entry) => normalizeEpisodeRecord(entry))
+    .filter(Boolean)
+    .filter((entry) => !currentProjectName || entry.currentProjectName === currentProjectName || (entry.relatedProjects ?? []).includes(currentProjectName))
+    .filter((entry) => !normalizedQuery || `${entry.query} ${entry.summary} ${entry.topPattern}`.toLowerCase().includes(normalizedQuery))
+    .sort((left, right) => String(right.at ?? '').localeCompare(String(left.at ?? '')))
+    .slice(0, Math.max(Number(limit ?? 4), 1));
+}
+
+export async function listDistillationCandidates(config, { currentProjectName = null, limit = 4 } = {}) {
+  await ensureBrainLayout(config);
+  return normalizeDistillationCandidates(await readJson(getDistillationCandidatesPath(config), []))
+    .filter((candidate) => !currentProjectName || candidate.projectName === currentProjectName || candidate.targetProjectName === currentProjectName)
+    .slice(0, Math.max(Number(limit ?? 4), 1));
+}
+
+export async function upsertDistillationCandidate(config, candidate = {}) {
+  await ensureBrainLayout(config);
+  const normalizedCandidate = normalizeDistillationCandidate(candidate);
+  if (!normalizedCandidate) {
+    return null;
+  }
+  const candidates = normalizeDistillationCandidates(await readJson(getDistillationCandidatesPath(config), []));
+  const existingIndex = candidates.findIndex((entry) => entry.id === normalizedCandidate.id);
+  if (existingIndex >= 0) {
+    candidates[existingIndex] = {
+      ...candidates[existingIndex],
+      ...normalizedCandidate,
+      createdAt: candidates[existingIndex].createdAt ?? normalizedCandidate.createdAt,
+    };
+  } else {
+    candidates.unshift(normalizedCandidate);
+  }
+  const nextCandidates = normalizeDistillationCandidates(candidates).slice(0, MAX_DISTILLATION_CANDIDATES);
+  await writeJson(getDistillationCandidatesPath(config), nextCandidates);
+  return nextCandidates.find((entry) => entry.id === normalizedCandidate.id) ?? normalizedCandidate;
+}
+
+export async function recordDecisionJournal(config, decision = {}) {
+  await ensureBrainLayout(config);
+  const normalizedDecision = normalizeDecisionRecord(decision);
+  if (!normalizedDecision) {
+    return null;
+  }
+  await appendFile(getDecisionJournalPath(config), `${JSON.stringify(normalizedDecision)}\n`, 'utf8');
+  await trimJsonLinesFile(getDecisionJournalPath(config), MAX_DECISIONS);
+  return normalizedDecision;
+}
+
+export async function listDecisionJournal(config, { currentProjectName = null, limit = 4 } = {}) {
+  await ensureBrainLayout(config);
+  return parseJsonLines(await readText(getDecisionJournalPath(config), ''))
+    .map((entry) => normalizeDecisionRecord(entry))
+    .filter(Boolean)
+    .filter((entry) => !currentProjectName || entry.currentProjectName === currentProjectName)
+    .sort((left, right) => String(right.at ?? '').localeCompare(String(left.at ?? '')))
+    .slice(0, Math.max(Number(limit ?? 4), 1));
+}
+
+export async function upsertInvalidationEntry(config, entry = {}) {
+  await ensureBrainLayout(config);
+  const normalizedEntry = normalizeInvalidationEntry(entry);
+  if (!normalizedEntry) {
+    return null;
+  }
+  const entries = normalizeInvalidationEntries(await readJson(getInvalidationIndexPath(config), []));
+  const existingIndex = entries.findIndex((item) => item.id === normalizedEntry.id);
+  if (existingIndex >= 0) {
+    entries[existingIndex] = {
+      ...entries[existingIndex],
+      ...normalizedEntry,
+    };
+  } else {
+    entries.unshift(normalizedEntry);
+  }
+  const nextEntries = normalizeInvalidationEntries(entries).slice(0, MAX_INVALIDATIONS);
+  await writeJson(getInvalidationIndexPath(config), nextEntries);
+  return nextEntries.find((item) => item.id === normalizedEntry.id) ?? normalizedEntry;
+}
+
+export async function listInvalidationEntries(config, { currentProjectName = null, activeOnly = false, limit = 6 } = {}) {
+  await ensureBrainLayout(config);
+  return normalizeInvalidationEntries(await readJson(getInvalidationIndexPath(config), []))
+    .filter((entry) => !currentProjectName || entry.projectName === currentProjectName)
+    .filter((entry) => !activeOnly || entry.status !== 'resolved')
+    .slice(0, Math.max(Number(limit ?? 6), 1));
+}
+
+export async function recordPromptPatternUsage(config, pattern = {}) {
+  await ensureBrainLayout(config);
+  const normalizedPattern = normalizePromptPattern(pattern);
+  if (!normalizedPattern) {
+    return null;
+  }
+  const patterns = normalizePromptPatterns(await readJson(getPromptPatternsPath(config), []));
+  const existingIndex = patterns.findIndex((entry) => entry.id === normalizedPattern.id);
+  if (existingIndex >= 0) {
+    patterns[existingIndex] = {
+      ...patterns[existingIndex],
+      useCount: Number(patterns[existingIndex].useCount ?? 0) + 1,
+      updatedAt: normalizedPattern.updatedAt,
+      lastQuery: normalizedPattern.lastQuery,
+      retrievalProfile: normalizedPattern.retrievalProfile,
+      currentProjectName: normalizedPattern.currentProjectName,
+      supportingEpisodeIds: uniqueStrings([...(patterns[existingIndex].supportingEpisodeIds ?? []), ...(normalizedPattern.supportingEpisodeIds ?? [])]).slice(0, 6),
+    };
+  } else {
+    patterns.unshift(normalizedPattern);
+  }
+  const nextPatterns = normalizePromptPatterns(patterns).slice(0, MAX_PROMPT_PATTERNS);
+  await writeJson(getPromptPatternsPath(config), nextPatterns);
+  return nextPatterns.find((entry) => entry.id === normalizedPattern.id) ?? normalizedPattern;
+}
+
+export async function listPromptPatterns(config, { currentProjectName = null, limit = 4 } = {}) {
+  await ensureBrainLayout(config);
+  return normalizePromptPatterns(await readJson(getPromptPatternsPath(config), []))
+    .filter((entry) => !currentProjectName || entry.currentProjectName === currentProjectName)
+    .slice(0, Math.max(Number(limit ?? 4), 1));
+}
+
+export async function saveProjectGraph(config, graph = {}) {
+  await ensureBrainLayout(config);
+  const normalizedGraph = normalizeProjectGraph(graph);
+  await writeJson(getProjectGraphPath(config), normalizedGraph);
+  return normalizedGraph;
+}
+
+export async function loadProjectGraph(config) {
+  await ensureBrainLayout(config);
+  return normalizeProjectGraph(await readJson(getProjectGraphPath(config), null));
+}
+
+export async function saveWorkspaceState(config, workspace = {}) {
+  await ensureBrainLayout(config);
+  const normalizedWorkspace = normalizeWorkspaceState(workspace);
+  if (!normalizedWorkspace) {
+    return null;
+  }
+  await writeJson(getWorkspaceFilePath(config, normalizedWorkspace.id), normalizedWorkspace);
+  return normalizedWorkspace;
+}
+
+export async function loadWorkspaceState(config, workspaceId) {
+  await ensureBrainLayout(config);
+  return normalizeWorkspaceState(await readJson(getWorkspaceFilePath(config, workspaceId), null));
+}
+
 function buildMemoryAdmissionPayload(state, {
   config,
   queryFingerprint,
@@ -471,6 +675,239 @@ function buildMemoryAdmissionPayload(state, {
     suppressedDuplicateCount: summary.suppressedDuplicateCount,
     touchedCandidates,
   };
+}
+
+function normalizeEpisodeRecord(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const query = String(entry.query ?? '').trim();
+  if (!query) {
+    return null;
+  }
+  const at = entry.at ?? timestamp();
+  const currentProjectName = entry.currentProjectName ? String(entry.currentProjectName) : null;
+  return {
+    id: String(entry.id ?? sha256(`${entry.source ?? 'query'}:${currentProjectName ?? 'global'}:${query}:${at}`)),
+    at,
+    source: entry.source === 'consult' ? 'consult' : 'query',
+    query,
+    summary: String(entry.summary ?? '').slice(0, 240),
+    currentProjectName,
+    mode: String(entry.mode ?? 'local-only'),
+    relatedProjects: uniqueStrings((entry.relatedProjects ?? []).map((value) => String(value))),
+    topPattern: String(entry.topPattern ?? '').slice(0, 180),
+    evidenceQuality: String(entry.evidenceQuality ?? 'weak'),
+    confidence: Number(entry.confidence ?? 0),
+    supportCount: Number(entry.supportCount ?? 0),
+    noteReferences: normalizeNoteReferences(entry.noteReferences),
+    topResults: (entry.topResults ?? []).slice(0, 3).map((result) => ({
+      project: String(result?.project ?? 'unknown'),
+      noteType: String(result?.noteType ?? 'unknown'),
+      sourcePath: String(result?.sourcePath ?? 'unknown'),
+      evidenceQuality: String(result?.evidenceQuality ?? 'weak'),
+      confidence: Number(result?.confidence ?? 0),
+      snippet: String(result?.snippet ?? '').slice(0, 180),
+    })),
+  };
+}
+
+function normalizeNoteReferences(noteReferences) {
+  const base = noteReferences && typeof noteReferences === 'object' ? noteReferences : {};
+  return {
+    overview: base.overview ? String(base.overview) : null,
+    architecture: base.architecture ? String(base.architecture) : null,
+    learnings: base.learnings ? String(base.learnings) : null,
+    prompts: base.prompts ? String(base.prompts) : null,
+    knowledge: base.knowledge ? String(base.knowledge) : null,
+    documentationStyle: base.documentationStyle ? String(base.documentationStyle) : null,
+  };
+}
+
+function normalizeDistillationCandidates(candidates) {
+  return (candidates ?? [])
+    .map((candidate) => normalizeDistillationCandidate(candidate))
+    .filter(Boolean)
+    .sort((left, right) => String(right.updatedAt ?? '').localeCompare(String(left.updatedAt ?? '')));
+}
+
+function normalizeDistillationCandidate(candidate) {
+  if (!candidate || typeof candidate !== 'object') {
+    return null;
+  }
+  const title = String(candidate.title ?? '').trim();
+  if (!title) {
+    return null;
+  }
+  const targetType = ['project-learning', 'reusable-pattern', 'decision-journal', 'prompt-pattern'].includes(candidate.targetType)
+    ? candidate.targetType
+    : 'reusable-pattern';
+  const projectName = candidate.projectName ? String(candidate.projectName) : null;
+  const targetProjectName = candidate.targetProjectName ? String(candidate.targetProjectName) : (targetType === 'project-learning' ? projectName : null);
+  const createdAt = candidate.createdAt ?? timestamp();
+  const updatedAt = candidate.updatedAt ?? createdAt;
+  return {
+    id: String(candidate.id ?? sha256(`${targetType}:${targetProjectName ?? 'global'}:${title}`)),
+    createdAt,
+    updatedAt,
+    status: String(candidate.status ?? 'candidate'),
+    sourceEpisodeId: candidate.sourceEpisodeId ? String(candidate.sourceEpisodeId) : null,
+    projectName,
+    targetProjectName,
+    targetType,
+    targetPath: candidate.targetPath ? String(candidate.targetPath) : null,
+    title,
+    summary: String(candidate.summary ?? '').slice(0, 240),
+    query: String(candidate.query ?? '').slice(0, 240),
+    evidenceQuality: String(candidate.evidenceQuality ?? 'weak'),
+    confidence: Number(candidate.confidence ?? 0),
+    supportCount: Number(candidate.supportCount ?? 0),
+    sourcePath: candidate.sourcePath ? String(candidate.sourcePath) : null,
+  };
+}
+
+function normalizeDecisionRecord(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const summary = String(entry.summary ?? '').trim();
+  if (!summary) {
+    return null;
+  }
+  const at = entry.at ?? timestamp();
+  return {
+    id: String(entry.id ?? sha256(`${entry.currentProjectName ?? 'global'}:${summary}:${at}`)),
+    at,
+    currentProjectName: entry.currentProjectName ? String(entry.currentProjectName) : null,
+    query: String(entry.query ?? '').slice(0, 240),
+    summary: summary.slice(0, 240),
+    rationale: (entry.rationale ?? []).map((item) => String(item)).filter(Boolean).slice(0, 6),
+    recommendedAction: String(entry.recommendedAction ?? '').slice(0, 240),
+    evidenceQuality: String(entry.evidenceQuality ?? 'weak'),
+    confidence: Number(entry.confidence ?? 0),
+  };
+}
+
+function normalizeInvalidationEntry(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const projectName = entry.projectName ? String(entry.projectName) : null;
+  if (!projectName) {
+    return null;
+  }
+  const triggeredAt = entry.triggeredAt ?? timestamp();
+  return {
+    id: String(entry.id ?? sha256(`${projectName}:${entry.fingerprint ?? ''}:${triggeredAt}`)),
+    triggeredAt,
+    projectName,
+    fingerprint: String(entry.fingerprint ?? ''),
+    staleReasons: (entry.staleReasons ?? []).map((item) => String(item)).filter(Boolean).slice(0, 6),
+    affectedArtifacts: (entry.affectedArtifacts ?? []).map((item) => String(item)).filter(Boolean).slice(0, 10),
+    status: String(entry.status ?? 'active'),
+  };
+}
+
+function normalizeInvalidationEntries(entries) {
+  return (entries ?? [])
+    .map((entry) => normalizeInvalidationEntry(entry))
+    .filter(Boolean)
+    .sort((left, right) => String(right.triggeredAt ?? '').localeCompare(String(left.triggeredAt ?? '')));
+}
+
+function normalizePromptPattern(pattern) {
+  if (!pattern || typeof pattern !== 'object') {
+    return null;
+  }
+  const normalizedText = String(pattern.normalizedText ?? pattern.query ?? '').trim().toLowerCase();
+  if (!normalizedText) {
+    return null;
+  }
+  const currentProjectName = pattern.currentProjectName ? String(pattern.currentProjectName) : null;
+  return {
+    id: String(pattern.id ?? sha256(`${currentProjectName ?? 'global'}:${pattern.retrievalProfile ?? 'default'}:${normalizedText}`)),
+    createdAt: pattern.createdAt ?? timestamp(),
+    updatedAt: pattern.updatedAt ?? timestamp(),
+    currentProjectName,
+    normalizedText,
+    lastQuery: String(pattern.lastQuery ?? pattern.query ?? '').slice(0, 240),
+    retrievalProfile: String(pattern.retrievalProfile ?? 'default'),
+    useCount: Math.max(Number(pattern.useCount ?? 1), 1),
+    supportingEpisodeIds: uniqueStrings((pattern.supportingEpisodeIds ?? []).map((item) => String(item))).slice(0, 6),
+  };
+}
+
+function normalizePromptPatterns(patterns) {
+  return (patterns ?? [])
+    .map((pattern) => normalizePromptPattern(pattern))
+    .filter(Boolean)
+    .sort((left, right) => Number(right.useCount ?? 0) - Number(left.useCount ?? 0)
+      || String(right.updatedAt ?? '').localeCompare(String(left.updatedAt ?? '')));
+}
+
+function normalizeProjectGraph(graph) {
+  const base = graph && typeof graph === 'object' ? graph : {};
+  return {
+    updatedAt: base.updatedAt ?? null,
+    nodes: (base.nodes ?? []).map((node) => ({
+      project: String(node?.project ?? ''),
+      stack: (node?.stack ?? []).map((item) => String(item)).filter(Boolean).slice(0, 10),
+      validationSurfaces: (node?.validationSurfaces ?? []).map((item) => String(item)).filter(Boolean).slice(0, 6),
+      boundaries: (node?.boundaries ?? []).map((item) => String(item)).filter(Boolean).slice(0, 6),
+    })).filter((node) => node.project),
+    edges: (base.edges ?? []).map((edge) => ({
+      from: String(edge?.from ?? ''),
+      to: String(edge?.to ?? ''),
+      relation: String(edge?.relation ?? 'related'),
+      weight: Number(edge?.weight ?? 0),
+      reasons: (edge?.reasons ?? []).map((item) => String(item)).filter(Boolean).slice(0, 6),
+    })).filter((edge) => edge.from && edge.to),
+  };
+}
+
+function normalizeWorkspaceState(workspace) {
+  if (!workspace || typeof workspace !== 'object') {
+    return null;
+  }
+  const id = String(workspace.id ?? '').trim();
+  if (!id) {
+    return null;
+  }
+  return {
+    id,
+    createdAt: workspace.createdAt ?? timestamp(),
+    updatedAt: workspace.updatedAt ?? timestamp(),
+    currentProjectName: workspace.currentProjectName ? String(workspace.currentProjectName) : null,
+    task: String(workspace.task ?? '').slice(0, 240),
+    status: String(workspace.status ?? 'active'),
+    hypotheses: (workspace.hypotheses ?? []).map((item) => String(item)).filter(Boolean).slice(0, 10),
+    findings: (workspace.findings ?? []).map((item) => String(item)).filter(Boolean).slice(0, 12),
+    handoffs: (workspace.handoffs ?? []).map((item) => String(item)).filter(Boolean).slice(0, 12),
+  };
+}
+
+function parseJsonLines(content) {
+  return String(content ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+async function trimJsonLinesFile(filePath, maxEntries) {
+  const items = parseJsonLines(await readText(filePath, ''));
+  if (items.length <= maxEntries) {
+    return;
+  }
+  const trimmed = items.slice(items.length - maxEntries);
+  await writeText(filePath, `${trimmed.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
 }
 
 function buildTouchedResultKeys(results) {

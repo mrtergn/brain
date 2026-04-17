@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+import { assembleLiveContext } from '../context-assembler/index.mjs';
 import { createCliSemanticEmbedder, describeEmbedderRuntime } from '../embedder-runner/index.mjs';
 import { readProjectNoteContents } from '../obsidian-writer/index.mjs';
 import {
@@ -28,11 +29,16 @@ import {
   loadCachedProjectSnapshot,
   loadState,
   listCachedProjectSnapshots,
+  recordDecisionJournal,
+  recordEpisode,
   previewMemoryAdmission,
+  recordPromptPatternUsage,
   recordMemoryUsage,
   recordQuery,
   recordOperation,
+  saveWorkspaceState,
   saveState,
+  upsertDistillationCandidate,
 } from '../state-manager/index.mjs';
 import { stripLegacyManagedSections } from '../vault-contract/index.mjs';
 import { ChromaVectorStore } from '../vector-store/index.mjs';
@@ -62,6 +68,9 @@ export async function searchBrain({
   currentProjectPath,
   currentProjectName,
   topK = 6,
+  workspaceId = null,
+  agentId = null,
+  includePreflight = false,
   runtimeOptions,
   recordUsage = true,
   includeRelatedPatterns = true,
@@ -77,6 +86,7 @@ export async function searchBrain({
     relatedPatterns,
     recentLearnings,
     embedderRuntime,
+    assembledContext,
   } = await gatherLocalBrainContext({
     query,
     currentProjectPath,
@@ -86,6 +96,8 @@ export async function searchBrain({
     includeProjectSummary: false,
     includeRelatedPatterns,
     recentLearningsLimit: includeRecentLearnings ? 4 : 0,
+    workspaceId,
+    includePreflight,
     embedderSelection,
   });
 
@@ -118,6 +130,32 @@ export async function searchBrain({
     });
     await saveState(readyRuntime.config, readyRuntime.state);
     readyRuntime.state = await loadState(readyRuntime.config);
+    const recordedEpisode = await recordEpisode(readyRuntime.config, buildEpisodeRecord({
+      source: 'query',
+      query,
+      resolvedProject,
+      reasoningMode: reasoning.mode,
+      reasoningRelatedProjects: reasoning.relatedProjects,
+      results: retrievalResponse.results,
+      assembledContext,
+    }));
+    await recordPromptPatternUsage(readyRuntime.config, {
+      query,
+      currentProjectName: resolvedProject?.name ?? null,
+      retrievalProfile: assembledContext?.retrievalProfile ?? 'default',
+      supportingEpisodeIds: recordedEpisode ? [recordedEpisode.id] : [],
+      updatedAt: timestamp(),
+    });
+    if (workspaceId) {
+      await saveWorkspaceState(readyRuntime.config, buildWorkspaceSnapshot({
+        workspaceId,
+        currentProjectName: resolvedProject?.name ?? null,
+        task: query,
+        finding: assembledContext?.validationHints?.[0] ?? assembledContext?.provenanceSummary?.[0] ?? '',
+        handoff: agentId ? `${agentId}: search completed` : '',
+      }));
+    }
+    await maybePromoteEpisodeCandidate(readyRuntime.config, recordedEpisode);
   }
 
   await appendLog(buildLogPath(readyRuntime.config, 'brain-mcp.log'), `brain.search | query=${JSON.stringify(query)} | project=${resolvedProject?.name ?? 'global'}`);
@@ -155,6 +193,7 @@ export async function searchBrain({
     relatedPatterns,
     recentLearnings,
     memoryAdmission,
+    assembledContext,
     ...(includeEmbedderRuntime ? { embedderRuntime } : {}),
   };
 }
@@ -164,6 +203,9 @@ export async function consultBrain({
   currentProjectPath,
   currentProjectName,
   topK = 6,
+  workspaceId = null,
+  agentId = null,
+  includePreflight = false,
   runtimeOptions,
   recordUsage = true,
   embedderSelection = null,
@@ -178,6 +220,7 @@ export async function consultBrain({
     recentLearnings,
     projectSummary,
     embedderRuntime,
+    assembledContext,
   } = await gatherLocalBrainContext({
     query,
     currentProjectPath,
@@ -186,6 +229,8 @@ export async function consultBrain({
     runtimeOptions,
     includeProjectSummary: true,
     recentLearningsLimit: 4,
+    workspaceId,
+    includePreflight,
     embedderSelection,
   });
 
@@ -233,12 +278,50 @@ export async function consultBrain({
     });
     await saveState(readyRuntime.config, readyRuntime.state);
     readyRuntime.state = await loadState(readyRuntime.config);
+    const recordedEpisode = await recordEpisode(readyRuntime.config, buildEpisodeRecord({
+      source: 'consult',
+      query,
+      resolvedProject,
+      reasoningMode: payload.mode,
+      reasoningRelatedProjects: payload.localContext.relatedProjects,
+      results: retrievalResponse.results,
+      assembledContext,
+    }));
+    await recordPromptPatternUsage(readyRuntime.config, {
+      query,
+      currentProjectName: resolvedProject?.name ?? null,
+      retrievalProfile: assembledContext?.retrievalProfile ?? 'default',
+      supportingEpisodeIds: recordedEpisode ? [recordedEpisode.id] : [],
+      updatedAt: timestamp(),
+    });
+    await recordDecisionJournal(readyRuntime.config, {
+      at: timestamp(),
+      currentProjectName: resolvedProject?.name ?? null,
+      query,
+      summary: payload.synthesis.recommendedProjectApproach?.[0] ?? payload.synthesis.whatLocalSuggests?.[0] ?? '',
+      rationale: payload.researchDecision.rationale ?? [],
+      recommendedAction: payload.agentActions?.[0] ?? '',
+      evidenceQuality: payload.trustSummary.localEvidenceQuality ?? 'weak',
+      confidence: payload.localConfidence.score ?? 0,
+    });
+    if (workspaceId) {
+      await saveWorkspaceState(readyRuntime.config, buildWorkspaceSnapshot({
+        workspaceId,
+        currentProjectName: resolvedProject?.name ?? null,
+        task: query,
+        hypothesis: payload.synthesis.whatNeedsValidation?.[0] ?? '',
+        finding: payload.synthesis.recommendedProjectApproach?.[0] ?? '',
+        handoff: agentId ? `${agentId}: consult completed` : '',
+      }));
+    }
+    await maybePromoteEpisodeCandidate(readyRuntime.config, recordedEpisode);
   }
 
   await appendLog(buildLogPath(readyRuntime.config, 'brain-mcp.log'), `brain.consult | query=${JSON.stringify(query)} | project=${resolvedProject?.name ?? 'global'} | mode=${payload.mode}`);
   return {
     ...payload,
     memoryAdmission,
+    assembledContext,
     ...(includeEmbedderRuntime ? { embedderRuntime } : {}),
   };
 }
@@ -703,6 +786,8 @@ async function gatherLocalBrainContext({
   includeProjectSummary = false,
   includeRelatedPatterns = true,
   recentLearningsLimit = 4,
+  workspaceId = null,
+  includePreflight = false,
   embedderSelection = null,
 } = {}) {
   const runtime = await loadBrainRuntime(runtimeOptions);
@@ -715,12 +800,14 @@ async function gatherLocalBrainContext({
     selection: embedderSelection,
   });
   const vectorStore = new ChromaVectorStore(readyRuntime.config);
+  const retrievalProfile = inferRetrievalProfile(query, resolvedProject?.name);
   const retrievalResponse = await retrieveContext({
     queryText: String(query ?? '').trim(),
     topK: Math.max(Number(topK ?? 6), 1),
     embedder,
     vectorStore,
     currentProjectName: resolvedProject?.name ?? '',
+    retrievalProfile,
   });
   const reasoning = await reasonAboutQuery(readyRuntime.config, readyRuntime.state, retrievalResponse);
   const relatedPatterns = includeRelatedPatterns
@@ -736,6 +823,23 @@ async function gatherLocalBrainContext({
       limit: recentLearningsLimit,
     })
     : [];
+  const projectSummary = resolvedProject
+    ? await buildProjectSummaryPayload(readyRuntime, resolvedProject)
+    : null;
+  const assembledContext = await assembleLiveContext({
+    runtime: readyRuntime,
+    query,
+    resolvedProject,
+    retrievalResponse,
+    reasoning,
+    relatedPatterns,
+    recentLearnings,
+    projectSummary,
+    retrievalProfile,
+    workspaceId,
+    includePreflight,
+    embedderRuntime: describeEmbedderRuntime(embedder, embedderSelection),
+  });
 
   return {
     readyRuntime,
@@ -745,7 +849,118 @@ async function gatherLocalBrainContext({
     relatedPatterns,
     recentLearnings,
     embedderRuntime: describeEmbedderRuntime(embedder, embedderSelection),
-    projectSummary: includeProjectSummary && resolvedProject ? await buildProjectSummaryPayload(readyRuntime, resolvedProject) : null,
+    projectSummary,
+    assembledContext,
+  };
+}
+
+function inferRetrievalProfile(query, currentProjectName) {
+  const normalized = String(query ?? '').toLowerCase();
+  if (/decision|tradeoff|why did|why was|rationale/.test(normalized)) {
+    return 'decision-history';
+  }
+  if (/pattern|reusable|cross-project|across repos|similar repo/.test(normalized)) {
+    return 'cross-project-patterns';
+  }
+  if (currentProjectName) {
+    return 'current-project-strict';
+  }
+  return 'default';
+}
+
+function buildEpisodeRecord({
+  source,
+  query,
+  resolvedProject,
+  reasoningMode,
+  reasoningRelatedProjects,
+  results,
+  assembledContext,
+} = {}) {
+  const topResults = (results ?? []).slice(0, 3);
+  const leadResult = topResults[0];
+  return {
+    at: timestamp(),
+    source,
+    query: String(query ?? '').trim(),
+    summary: assembledContext?.validationHints?.[0]
+      ?? leadResult?.whyTrusted
+      ?? leadResult?.snippet
+      ?? '',
+    currentProjectName: resolvedProject?.name ?? null,
+    mode: reasoningMode,
+    relatedProjects: reasoningRelatedProjects ?? [],
+    topPattern: assembledContext?.provenanceSummary?.[0] ?? '',
+    evidenceQuality: leadResult?.evidenceQuality ?? 'weak',
+    confidence: Number(leadResult?.confidence ?? 0),
+    supportCount: Number(leadResult?.supportCount ?? 0),
+    noteReferences: assembledContext?.noteReferences ?? null,
+    topResults: topResults.map((result) => ({
+      project: result.project,
+      noteType: result.noteType,
+      sourcePath: result.sourcePath,
+      evidenceQuality: result.evidenceQuality,
+      confidence: result.confidence,
+      snippet: result.snippet,
+    })),
+  };
+}
+
+async function maybePromoteEpisodeCandidate(config, episode) {
+  if (!episode) {
+    return null;
+  }
+  const leadResult = episode.topResults?.[0];
+  if (!leadResult) {
+    return null;
+  }
+  const candidateConfidence = Number(episode.confidence ?? 0);
+  const evidenceQuality = String(episode.evidenceQuality ?? 'weak');
+  if (candidateConfidence < 0.72 && evidenceQuality !== 'strong') {
+    return null;
+  }
+  const targetType = episode.currentProjectName ? 'project-learning' : 'reusable-pattern';
+  return upsertDistillationCandidate(config, {
+    sourceEpisodeId: episode.id,
+    projectName: episode.currentProjectName,
+    targetProjectName: targetType === 'project-learning' ? episode.currentProjectName : null,
+    targetType,
+    targetPath: resolveEpisodeCandidateTargetPath(config, targetType, episode.currentProjectName),
+    title: buildEpisodeCandidateTitle(episode),
+    summary: episode.summary,
+    query: episode.query,
+    evidenceQuality,
+    confidence: candidateConfidence,
+    supportCount: episode.supportCount,
+    sourcePath: leadResult.sourcePath,
+    updatedAt: timestamp(),
+  });
+}
+
+function buildEpisodeCandidateTitle(episode) {
+  if (episode.currentProjectName) {
+    return `${episode.currentProjectName}: ${episode.query}`.slice(0, 160);
+  }
+  return `cross-project: ${episode.query}`.slice(0, 160);
+}
+
+function resolveEpisodeCandidateTargetPath(config, targetType, currentProjectName) {
+  if (targetType === 'project-learning' && currentProjectName) {
+    return path.join(config.vaultRoot, '01_Projects', currentProjectName, 'learnings.md');
+  }
+  return path.join(config.vaultRoot, '04_Knowledge_Base', 'reusable-patterns.md');
+}
+
+function buildWorkspaceSnapshot({ workspaceId, currentProjectName, task, hypothesis = '', finding = '', handoff = '' } = {}) {
+  return {
+    id: workspaceId,
+    currentProjectName,
+    task,
+    status: 'active',
+    updatedAt: timestamp(),
+    hypotheses: hypothesis ? [hypothesis] : [],
+    findings: finding ? [finding] : [],
+    handoffs: handoff ? [handoff] : [],
   };
 }
 

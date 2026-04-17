@@ -60,6 +60,7 @@ export async function retrieveContext({
   embedder,
   vectorStore,
   currentProjectName = '',
+  retrievalProfile = 'default',
 }) {
   const normalizedTopK = Math.max(Number(topK ?? 6), 1);
   const { expandedQueryText, expansionTerms } = expandQueryText(queryText);
@@ -77,6 +78,7 @@ export async function retrieveContext({
   ], {
     topK: normalizedTopK,
     currentProjectName,
+    retrievalProfile,
     expansionTerms,
     queryIntent,
   });
@@ -109,11 +111,12 @@ export function expandQueryText(queryText) {
   };
 }
 
-function rankResults(queryText, rawResults, { topK, currentProjectName, expansionTerms, queryIntent }) {
+function rankResults(queryText, rawResults, { topK, currentProjectName, retrievalProfile, expansionTerms, queryIntent }) {
   const ranked = new Map();
   for (const rawResult of rawResults) {
     const normalized = normalizeResult(queryText, rawResult, {
       currentProjectName,
+      retrievalProfile,
       expansionTerms,
       queryIntent,
     });
@@ -129,10 +132,10 @@ function rankResults(queryText, rawResults, { topK, currentProjectName, expansio
 
   const sortedResults = [...ranked.values()]
     .sort((left, right) => compareRankedResults(left, right, { currentProjectName }));
-  return selectDiverseResults(sortedResults, { topK, currentProjectName, queryIntent });
+  return selectDiverseResults(sortedResults, { topK, currentProjectName, queryIntent, retrievalProfile });
 }
 
-function normalizeResult(queryText, result, { currentProjectName, expansionTerms, queryIntent }) {
+function normalizeResult(queryText, result, { currentProjectName, retrievalProfile, expansionTerms, queryIntent }) {
   const snippet = truncate((result.document ?? '').replace(/\s+/g, ' '), 280);
   const distance = Number(result.distance ?? 1);
   const queryTokens = new Set(tokenize(queryText));
@@ -170,21 +173,24 @@ function normalizeResult(queryText, result, { currentProjectName, expansionTerms
     queryIntent,
   });
   const currentProjectBoost = currentProjectName && project === currentProjectName
-    ? (queryIntent?.repoSpecific ? 0.18 : 0.12)
+    ? resolveCurrentProjectWeight(retrievalProfile, queryIntent)
     : 0;
-  const reusablePatternBoost = canonicalKnowledgeSource ? 0.1 : 0;
+  const reusablePatternBoost = canonicalKnowledgeSource
+    ? (retrievalProfile === 'cross-project-patterns' ? 0.16 : 0.1)
+    : 0;
   const boundarySignalBoost = queryIntent?.boundaryAware && hasBoundarySignal(documentText) ? 0.05 : 0;
   const debuggingBoost = queryIntent?.debugging && hasDebugSignal(documentText) ? 0.04 : 0;
   const documentationBoost = queryIntent?.documentation && hasDocumentationSignal({ documentText, noteType, sourcePath }) ? 0.05 : 0;
+  const decisionHistoryBoost = retrievalProfile === 'decision-history' && ['learnings', 'prompts', 'architecture'].includes(noteType) ? 0.08 : 0;
   const phraseBonus = computePhraseBonus(queryText, documentText, queryIntent);
   const trustBonus = trustScore * (queryIntent?.repoSpecific || queryIntent?.shortQuery ? 0.14 : 0.1);
   const weakCrossProjectPenalty = currentProjectName
     && project !== currentProjectName
-    && queryIntent?.repoSpecific
+    && (queryIntent?.repoSpecific || retrievalProfile === 'current-project-strict')
     && trustScore < 0.46
-      ? 0.06
+      ? (retrievalProfile === 'current-project-strict' ? 0.12 : 0.06)
       : 0;
-  const relevanceScore = clamp((semanticScore * 0.48) + lexicalBonus + expansionBonus + phraseBonus + noteTypeBoost + currentProjectBoost + reusablePatternBoost + boundarySignalBoost + debuggingBoost + documentationBoost + trustBonus - weakCrossProjectPenalty, 0, 1);
+  const relevanceScore = clamp((semanticScore * 0.48) + lexicalBonus + expansionBonus + phraseBonus + noteTypeBoost + currentProjectBoost + reusablePatternBoost + boundarySignalBoost + debuggingBoost + documentationBoost + decisionHistoryBoost + trustBonus - weakCrossProjectPenalty, 0, 1);
   const matchSignals = uniqueStrings([
     semanticScore >= 0.45 ? 'semantic similarity' : '',
     currentProjectBoost > 0 ? 'current project boost' : '',
@@ -468,7 +474,7 @@ function normalizeEvidenceQuality(value) {
   return 'weak';
 }
 
-function selectDiverseResults(results, { topK, currentProjectName, queryIntent }) {
+function selectDiverseResults(results, { topK, currentProjectName, queryIntent, retrievalProfile }) {
   if (!currentProjectName) {
     return results.slice(0, topK);
   }
@@ -479,7 +485,9 @@ function selectDiverseResults(results, { topK, currentProjectName, queryIntent }
   const crossProjectResults = results.filter((result) => result.project !== currentProjectName);
   const currentBest = currentProjectResults[0] ?? null;
   const crossBest = crossProjectResults.find((result) => shouldIncludeCrossProjectResult(result, currentBest, queryIntent)) ?? null;
-  const preferredCurrentProjectCount = queryIntent?.repoSpecific ? Math.min(2, topK) : 1;
+  const preferredCurrentProjectCount = retrievalProfile === 'current-project-strict'
+    ? Math.min(3, topK)
+    : (queryIntent?.repoSpecific ? Math.min(2, topK) : 1);
 
   const pushResult = (result) => {
     if (!result || seenIds.has(result.id) || selected.length >= topK) {
@@ -501,7 +509,7 @@ function selectDiverseResults(results, { topK, currentProjectName, queryIntent }
         continue;
       }
       const selectedCrossProjectCount = selected.filter((entry) => entry.project !== currentProjectName).length;
-      if (selectedCrossProjectCount >= (queryIntent?.repoSpecific ? 1 : 2)
+      if (selectedCrossProjectCount >= (retrievalProfile === 'current-project-strict' ? 0 : (queryIntent?.repoSpecific ? 1 : 2))
         && result.relevanceScore < (queryIntent?.repoSpecific ? 0.62 : 0.58)
         && Number(result.trustScore ?? 0) < 0.7) {
         continue;
@@ -540,4 +548,17 @@ function shouldIncludeCrossProjectResult(result, currentBest, queryIntent) {
   return result.relevanceScore >= 0.58
     || result.relevanceScore + 0.06 >= currentBest.relevanceScore
     || Number(result.trustScore ?? 0) >= 0.76;
+}
+
+function resolveCurrentProjectWeight(retrievalProfile, queryIntent) {
+  if (retrievalProfile === 'current-project-strict') {
+    return queryIntent?.repoSpecific ? 0.24 : 0.18;
+  }
+  if (retrievalProfile === 'current-project-plus-neighbors') {
+    return queryIntent?.repoSpecific ? 0.2 : 0.14;
+  }
+  if (retrievalProfile === 'cross-project-patterns') {
+    return queryIntent?.repoSpecific ? 0.12 : 0.08;
+  }
+  return queryIntent?.repoSpecific ? 0.18 : 0.12;
 }

@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 
 import { LocalSemanticEmbedder, prewarmEmbeddingService, summarizeEmbeddingBatch } from '../../packages/embeddings/index.mjs';
 import { consultBrain, searchBrain } from '../../packages/brain-service/index.mjs';
+import { buildProjectGraph } from '../../packages/project-graph/index.mjs';
 import {
   buildRunnerStatusSummary,
   createCliSemanticEmbedder,
@@ -34,6 +35,7 @@ import {
   getProjectState,
   listCachedProjectSnapshots,
   loadProjectChunks,
+  saveProjectGraph,
   loadState,
   recordMemoryUsage,
   recordFailure,
@@ -42,6 +44,7 @@ import {
   saveState,
   setProjectState,
   summarizeMemoryAdmission,
+  upsertInvalidationEntry,
 } from '../../packages/state-manager/index.mjs';
 import {
   buildGlobalKnowledgeSources,
@@ -89,6 +92,16 @@ export async function runScan(options = {}) {
   for (const project of scanResult.projects) {
     await cacheProjectSnapshot(config, project);
     const previous = getProjectState(state, project.name);
+    if (previous?.fingerprint && previous.fingerprint !== project.fingerprint) {
+      await upsertInvalidationEntry(config, {
+        projectName: project.name,
+        fingerprint: project.fingerprint,
+        triggeredAt: scanResult.completedAt,
+        staleReasons: ['project fingerprint changed after scan'],
+        affectedArtifacts: ['episodes', 'distillation-candidates', 'prompt-patterns', 'causal-graph'],
+        status: 'active',
+      });
+    }
     setProjectState(state, project.name, {
       ...(previous ?? {}),
       name: project.name,
@@ -103,6 +116,8 @@ export async function runScan(options = {}) {
       chunkCount: previous?.chunkCount ?? 0,
     });
   }
+
+  await saveProjectGraph(config, buildProjectGraph(scanResult.projects));
 
   for (const failure of scanResult.failures) {
     recordFailure(state, failure);
